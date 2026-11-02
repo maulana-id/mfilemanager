@@ -1,4 +1,21 @@
 <resources>
-    <style name="AppTheme" parent="Theme.AppCompat.DayNight.NoActionBar">
+    <style name="AppTheme.Base" parent="Theme.AppCompat.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/vscode_surface</item>
+        <item name="colorPrimaryDark">@color/vscode_status_bar</item>
+        <item name="colorAccent">@color/vscode_accent</item>
+        <item name="colorControlNormal">@color/vscode_icon</item>
+        <item name="colorControlActivated">@color/vscode_accent</item>
+        <item name="colorControlHighlight">@color/vscode_ripple</item>
+        <item name="android:windowBackground">@color/vscode_editor_bg</item>
+        <item name="android:colorBackground">@color/vscode_editor_bg</item>
+        <item name="android:statusBarColor">@color/vscode_status_bar</item>
+        <item name="android:navigationBarColor">@color/vscode_navigation_bg</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:textColorPrimary">@color/vscode_text</item>
+        <item name="android:textColorSecondary">@color/vscode_text_muted</item>
+        <item name="android:textColorHint">@color/vscode_text_muted</item>
+        <item name="android:textColorLink">@color/vscode_accent</item>
     </style>
+
+    <style name="AppTheme" parent="AppTheme.Base" />
 </resources>

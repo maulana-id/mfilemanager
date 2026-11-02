@@ -1,98 +1,104 @@
-<LinearLayout
-    xmlns:android="http://schemas.android.com/apk/res/android"
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
+    android:background="@color/vscode_editor_bg"
     android:orientation="vertical"
-    android:padding="6dp"
     tools:context=".MainActivity">
 
-    <!-- Title and settings bar -->
+    <!-- VS Code style title bar -->
     <LinearLayout
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
+        android:layout_height="48dp"
+        android:background="@color/vscode_surface"
         android:gravity="center_vertical"
         android:orientation="horizontal"
-        android:paddingBottom="2dp">
+        android:paddingStart="12dp"
+        android:paddingEnd="4dp">
+
         <TextView
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
+            android:fontFamily="sans-serif-medium"
             android:text="@string/app_name"
-            android:textStyle="bold"
-            android:textAppearance="?android:attr/textAppearanceMedium" />
+            android:textColor="@color/vscode_text"
+            android:textSize="14sp" />
+
         <ImageButton
             android:id="@+id/settingsButton"
-            android:layout_width="36dp"
-            android:layout_height="36dp"
-            android:padding="6dp"
-            android:scaleType="fitCenter"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
             android:background="?attr/selectableItemBackgroundBorderless"
             android:contentDescription="Settings"
+            android:padding="10dp"
+            android:scaleType="fitCenter"
             android:src="@drawable/ic_action_settings"
+            app:tint="@color/vscode_icon"
             android:tooltipText="Settings" />
     </LinearLayout>
 
-    <!-- Navigation and path bar -->
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="1dp"
+        android:background="@color/vscode_border" />
+
+    <!-- Custom path stays at the top -->
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:gravity="center_vertical"
         android:orientation="horizontal"
+        android:paddingStart="8dp"
+        android:paddingTop="6dp"
+        android:paddingEnd="4dp"
         android:paddingBottom="2dp">
-        <ImageButton
-            android:id="@+id/homeButton"
-            android:layout_width="36dp"
-            android:layout_height="36dp"
-            android:padding="6dp"
-            android:scaleType="fitCenter"
-            android:background="?attr/selectableItemBackgroundBorderless"
-            android:contentDescription="Home folder"
-            android:src="@drawable/ic_action_home"
-            android:tooltipText="Home folder" />
-        <ImageButton
-            android:id="@+id/upButton"
-            android:layout_width="36dp"
-            android:layout_height="36dp"
-            android:padding="6dp"
-            android:scaleType="fitCenter"
-            android:background="?attr/selectableItemBackgroundBorderless"
-            android:contentDescription="Parent folder"
-            android:src="@drawable/ic_action_up"
-            android:tooltipText="Parent folder" />
+
         <EditText
             android:id="@+id/pathInput"
             android:layout_width="0dp"
-            android:layout_height="36dp"
+            android:layout_height="38dp"
             android:layout_weight="1"
-            android:layout_marginStart="2dp"
-            android:layout_marginEnd="2dp"
-            android:paddingStart="8dp"
-            android:paddingEnd="8dp"
+            android:background="@drawable/vscode_input_background"
+            android:gravity="center_vertical|start"
             android:hint="Folder path"
-            android:textSize="12sp"
+            android:imeOptions="actionGo"
+            android:importantForAutofill="no"
             android:inputType="textUri"
             android:maxLines="1"
-            android:selectAllOnFocus="true" />
+            android:paddingStart="10dp"
+            android:paddingEnd="10dp"
+            android:selectAllOnFocus="true"
+            android:singleLine="true"
+            android:textColor="@color/vscode_text"
+            android:textColorHint="@color/vscode_text_muted"
+            android:textSize="12sp" />
+
         <ImageButton
             android:id="@+id/goButton"
-            android:layout_width="36dp"
-            android:layout_height="36dp"
-            android:padding="6dp"
-            android:scaleType="fitCenter"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:layout_marginStart="3dp"
             android:background="?attr/selectableItemBackgroundBorderless"
             android:contentDescription="Go to path"
+            android:padding="10dp"
+            android:scaleType="fitCenter"
             android:src="@drawable/ic_action_go"
+            app:tint="@color/vscode_icon"
             android:tooltipText="Go to path" />
+
         <ImageButton
             android:id="@+id/createButton"
-            android:layout_width="36dp"
-            android:layout_height="36dp"
-            android:padding="6dp"
-            android:scaleType="fitCenter"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
             android:background="?attr/selectableItemBackgroundBorderless"
             android:contentDescription="Create folder or file"
+            android:padding="10dp"
+            android:scaleType="fitCenter"
             android:src="@drawable/ic_action_add"
+            app:tint="@color/vscode_icon"
             android:tooltipText="Create folder or file" />
     </LinearLayout>
 
@@ -100,73 +106,144 @@
     <EditText
         android:id="@+id/searchInput"
         android:layout_width="match_parent"
-        android:layout_height="34dp"
+        android:layout_height="38dp"
+        android:layout_marginStart="8dp"
+        android:layout_marginTop="4dp"
+        android:layout_marginEnd="8dp"
         android:layout_marginBottom="2dp"
-        android:paddingStart="8dp"
-        android:paddingEnd="8dp"
+        android:background="@drawable/vscode_input_background"
+        android:gravity="center_vertical|start"
         android:hint="Search files and folders"
-        android:textSize="12sp"
+        android:imeOptions="actionSearch"
+        android:importantForAutofill="no"
         android:inputType="text"
-        android:maxLines="1" />
+        android:maxLines="1"
+        android:paddingStart="10dp"
+        android:paddingEnd="10dp"
+        android:singleLine="true"
+        android:textColor="@color/vscode_text"
+        android:textColorHint="@color/vscode_text_muted"
+        android:textSize="12sp" />
 
     <TextView
         android:id="@+id/selectionText"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
+        android:paddingStart="12dp"
         android:paddingTop="2dp"
+        android:paddingEnd="12dp"
         android:paddingBottom="2dp"
-        android:paddingStart="4dp"
-        android:paddingEnd="4dp"
+        android:textColor="@color/vscode_text_muted"
         android:textSize="11sp"
-        android:text="Nothing selected" />
+        android:visibility="gone"
+        tools:text="3 item(s) selected" />
 
-    <!-- Unified tree/file list -->
-    <ListView
-        android:id="@+id/fileList"
+    <!-- File list with a floating navigation rail for one-handed use -->
+    <FrameLayout
         android:layout_width="match_parent"
         android:layout_height="0dp"
-        android:layout_weight="1"
-        android:choiceMode="none"
-        android:dividerHeight="0.5dp" />
+        android:layout_weight="1">
+
+        <androidx.recyclerview.widget.RecyclerView
+            android:id="@+id/fileList"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:clipToPadding="false"
+            android:overScrollMode="ifContentScrolls"
+            android:paddingBottom="132dp"
+            android:scrollbars="vertical" />
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="bottom|end"
+            android:layout_margin="12dp"
+            android:background="@drawable/vscode_nav_rail_background"
+            android:elevation="8dp"
+            android:orientation="vertical">
+
+            <ImageButton
+                android:id="@+id/homeButton"
+                android:layout_width="52dp"
+                android:layout_height="52dp"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:contentDescription="Home folder"
+                android:padding="14dp"
+                android:scaleType="fitCenter"
+                android:src="@drawable/ic_action_home"
+                app:tint="@color/vscode_icon"
+                android:tooltipText="Home folder" />
+
+            <View
+                android:layout_width="24dp"
+                android:layout_height="1dp"
+                android:layout_gravity="center_horizontal"
+                android:background="@color/vscode_border" />
+
+            <ImageButton
+                android:id="@+id/upButton"
+                android:layout_width="52dp"
+                android:layout_height="52dp"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:contentDescription="Parent folder"
+                android:padding="14dp"
+                android:scaleType="fitCenter"
+                android:src="@drawable/ic_action_up"
+                app:tint="@color/vscode_icon"
+                android:tooltipText="Parent folder" />
+        </LinearLayout>
+    </FrameLayout>
+
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="1dp"
+        android:background="@color/vscode_border" />
 
     <!-- Share status footer -->
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
+        android:background="@color/vscode_surface"
         android:gravity="center_vertical"
         android:orientation="horizontal"
-        android:paddingStart="4dp"
+        android:paddingStart="12dp"
         android:paddingTop="2dp"
         android:paddingEnd="4dp"
         android:paddingBottom="2dp">
+
         <TextView
             android:id="@+id/httpShareStatus"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
             android:maxLines="2"
-            android:text="HTTP sharing is off"
-            android:textAppearance="?android:attr/textAppearanceSmall" />
+            android:text="File sharing is off"
+            android:textColor="@color/vscode_text_muted"
+            android:textSize="11sp" />
+
         <ImageButton
             android:id="@+id/copyHttpShareUrlButton"
-            android:layout_width="36dp"
-            android:layout_height="36dp"
-            android:padding="6dp"
-            android:scaleType="fitCenter"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
             android:background="?attr/selectableItemBackgroundBorderless"
             android:contentDescription="Copy HTTP share address"
+            android:padding="10dp"
+            android:scaleType="fitCenter"
             android:src="@drawable/ic_action_copy"
+            app:tint="@color/vscode_icon"
             android:tooltipText="Copy HTTP share address"
             android:visibility="gone" />
+
         <ImageButton
             android:id="@+id/stopHttpShareButton"
-            android:layout_width="36dp"
-            android:layout_height="36dp"
-            android:padding="6dp"
-            android:scaleType="fitCenter"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
             android:background="?attr/selectableItemBackgroundBorderless"
             android:contentDescription="Stop HTTP sharing"
+            android:padding="10dp"
+            android:scaleType="fitCenter"
             android:src="@drawable/ic_action_stop"
+            app:tint="@color/vscode_icon"
             android:tooltipText="Stop HTTP sharing"
             android:visibility="gone" />
     </LinearLayout>

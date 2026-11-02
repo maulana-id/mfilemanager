@@ -1,0 +1,20 @@
+<resources>
+    <!-- VS Code Dark+ palette -->
+    <color name="vscode_editor_bg">#FF1E1E1E</color>
+    <color name="vscode_surface">#FF252526</color>
+    <color name="vscode_border">#FF3C3C3C</color>
+    <color name="vscode_text">#FFCCCCCC</color>
+    <color name="vscode_text_muted">#FF9D9D9D</color>
+    <color name="vscode_accent">#FF007ACC</color>
+    <color name="vscode_status_bar">#FF007ACC</color>
+    <color name="vscode_selection">#FF094771</color>
+    <color name="vscode_selection_check">#FFFFFFFF</color>
+    <color name="vscode_list_hover">#FF2A2D2E</color>
+    <color name="vscode_icon">#FFCCCCCC</color>
+    <color name="vscode_input_bg">#FF3C3C3C</color>
+    <color name="vscode_ripple">#33FFFFFF</color>
+    <color name="vscode_folder_icon">#FF90A4AE</color>
+    <color name="vscode_navigation_bg">#FF1E1E1E</color>
+
+    <color name="ic_launcher_background">#FF007ACC</color>
+</resources>

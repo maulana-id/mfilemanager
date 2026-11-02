@@ -32,9 +32,13 @@ import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.animation.DecelerateInterpolator;
-import android.widget.BaseAdapter;
 import android.widget.ImageView;
 import android.widget.TextView;
+
+import androidx.annotation.NonNull;
+import androidx.recyclerview.widget.DiffUtil;
+import androidx.recyclerview.widget.ListAdapter;
+import androidx.recyclerview.widget.RecyclerView;
 
 import java.io.File;
 import java.io.IOException;
@@ -43,13 +47,23 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 
-public final class FileListAdapter extends BaseAdapter {
+public final class FileListAdapter extends ListAdapter<FileListAdapter.Row, RecyclerView.ViewHolder> {
     public interface OnChevronClickListener {
         void onChevronClick(File file);
+    }
+
+    public interface OnItemClickListener {
+        void onItemClick(File file);
+    }
+
+    public interface OnItemLongClickListener {
+        boolean onItemLongClick(File file);
     }
 
     public static final class Row {
@@ -61,9 +75,11 @@ public final class FileListAdapter extends BaseAdapter {
         final boolean isDirectory;
         final boolean isExpanded;
         final boolean hasChildren;
+        final boolean treeNode;
 
         private Row(File file, String title, String details, boolean selected,
-                int depth, boolean isDirectory, boolean isExpanded, boolean hasChildren) {
+                int depth, boolean isDirectory, boolean isExpanded, boolean hasChildren,
+                boolean treeNode) {
             this.file = file;
             this.title = title;
             this.details = details;
@@ -72,36 +88,70 @@ public final class FileListAdapter extends BaseAdapter {
             this.isDirectory = isDirectory;
             this.isExpanded = isExpanded;
             this.hasChildren = hasChildren;
+            this.treeNode = treeNode;
         }
 
         public static Row file(File file, String details, boolean selected) {
-            return new Row(file, null, details, selected, 0, file != null && file.isDirectory(), false, false);
+            return new Row(file, null, details, selected, 0,
+                    file != null && file.isDirectory(), false, false, false);
         }
 
         public static Row treeNode(File file, String details, boolean selected,
                 int depth, boolean isDirectory, boolean isExpanded, boolean hasChildren) {
-            return new Row(file, null, details, selected, depth, isDirectory, isExpanded, hasChildren);
+            return new Row(file, null, details, selected, depth, isDirectory, isExpanded,
+                    hasChildren, true);
         }
 
         public static Row heading(String title) {
-            return new Row(null, title, null, false, 0, false, false, false);
+            return new Row(null, title, null, false, 0, false, false, false, false);
         }
 
         public boolean isHeading() {
             return file == null;
         }
+
+        public File getFile() {
+            return file;
+        }
+
+        /** Stable identity used by DiffUtil and RecyclerView stable ids. */
+        public String key() {
+            return isHeading() ? "heading:" + title : file.getAbsolutePath();
+        }
+
+        boolean contentsEqual(Row other) {
+            return depth == other.depth
+                    && selected == other.selected
+                    && isDirectory == other.isDirectory
+                    && isExpanded == other.isExpanded
+                    && hasChildren == other.hasChildren
+                    && treeNode == other.treeNode
+                    && Objects.equals(title, other.title)
+                    && Objects.equals(details, other.details);
+        }
     }
 
+    private static final DiffUtil.ItemCallback<Row> DIFF_CALLBACK = new DiffUtil.ItemCallback<Row>() {
+        @Override
+        public boolean areItemsTheSame(@NonNull Row oldItem, @NonNull Row newItem) {
+            return oldItem.key().equals(newItem.key());
+        }
+
+        @Override
+        public boolean areContentsTheSame(@NonNull Row oldItem, @NonNull Row newItem) {
+            return oldItem.contentsEqual(newItem);
+        }
+    };
+
+    private static final int TYPE_HEADING = 0;
+    private static final int TYPE_ROW = 1;
+    private static final String PAYLOAD_THUMBNAIL = "thumbnail";
     private static final int THUMBNAIL_EDGE = 72;
+
     private final LayoutInflater inflater;
-    private final List<Row> rows = new ArrayList<>();
     private final ExecutorService thumbnailExecutor = Executors.newFixedThreadPool(2);
     private final Set<String> pendingThumbnails = Collections.synchronizedSet(new HashSet<>());
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private volatile boolean closed;
-    private OnChevronClickListener chevronClickListener;
-    private boolean animationsEnabled = true;
-    private int lastAnimatedPosition = -1;
     private final LruCache<String, Bitmap> thumbnailCache = new LruCache<String, Bitmap>(12 * 1024) {
         @Override
         protected int sizeOf(String key, Bitmap bitmap) {
@@ -109,154 +159,83 @@ public final class FileListAdapter extends BaseAdapter {
         }
     };
 
+    private volatile boolean closed;
+    private OnChevronClickListener chevronClickListener;
+    private OnItemClickListener itemClickListener;
+    private OnItemLongClickListener itemLongClickListener;
+    private boolean animationsEnabled = true;
+
     public FileListAdapter(Context context) {
+        super(DIFF_CALLBACK);
         inflater = LayoutInflater.from(context);
+        setHasStableIds(true);
     }
 
     public void setOnChevronClickListener(OnChevronClickListener listener) {
         this.chevronClickListener = listener;
     }
 
+    public void setOnItemClickListener(OnItemClickListener listener) {
+        this.itemClickListener = listener;
+    }
+
+    public void setOnItemLongClickListener(OnItemLongClickListener listener) {
+        this.itemLongClickListener = listener;
+    }
+
     public void setAnimationsEnabled(boolean enabled) {
         this.animationsEnabled = enabled;
-        notifyDataSetChanged();
     }
 
-    public void setRows(List<Row> newRows) {
-        rows.clear();
-        rows.addAll(newRows);
-        lastAnimatedPosition = -1;
-        notifyDataSetChanged();
-    }
-
-    @Override
-    public int getCount() {
-        return rows.size();
-    }
-
-    @Override
-    public Row getItem(int position) {
-        return rows.get(position);
+    /**
+     * Submits a whole new list. DiffUtil runs on a background thread, so only rows that
+     * actually changed are rebound and only rows that were inserted/removed animate.
+     */
+    public void submitRows(List<Row> newRows, Runnable commitCallback) {
+        submitList(new ArrayList<>(newRows), commitCallback);
     }
 
     @Override
     public long getItemId(int position) {
-        return position;
-    }
-
-    @Override
-    public int getViewTypeCount() {
-        return 2;
+        return getItem(position).key().hashCode();
     }
 
     @Override
     public int getItemViewType(int position) {
-        return getItem(position).isHeading() ? 0 : 1;
+        return getItem(position).isHeading() ? TYPE_HEADING : TYPE_ROW;
+    }
+
+    @NonNull
+    @Override
+    public RecyclerView.ViewHolder onCreateViewHolder(@NonNull ViewGroup parent, int viewType) {
+        if (viewType == TYPE_HEADING) {
+            return new HeadingHolder(inflater.inflate(R.layout.file_list_heading, parent, false));
+        }
+        return new RowHolder(inflater.inflate(R.layout.file_list_item, parent, false));
     }
 
     @Override
-    public boolean isEnabled(int position) {
-        return !getItem(position).isHeading();
-    }
-
-    @Override
-    public View getView(int position, View convertView, ViewGroup parent) {
+    public void onBindViewHolder(@NonNull RecyclerView.ViewHolder holder, int position) {
         Row row = getItem(position);
-        if (row.isHeading()) {
-            TextView heading = convertView instanceof TextView
-                    ? (TextView) convertView
-                    : new TextView(parent.getContext());
-            heading.setText(row.title);
-            heading.setTextAppearance(androidx.appcompat.R.style.TextAppearance_AppCompat_Small);
-            int horizontal = dp(parent.getContext(), 8);
-            int vertical = dp(parent.getContext(), 4);
-            heading.setPadding(horizontal, vertical, horizontal, vertical);
-            return heading;
-        }
-
-        View view = convertView;
-        RowHolder holder;
-        if (view == null || view instanceof TextView) {
-            view = inflater.inflate(R.layout.file_list_item, parent, false);
-            holder = new RowHolder(view);
-            view.setTag(holder);
+        if (holder instanceof HeadingHolder) {
+            ((HeadingHolder) holder).bind(row);
         } else {
-            holder = (RowHolder) view.getTag();
-            if (holder == null) {
-                holder = new RowHolder(view);
-                view.setTag(holder);
+            ((RowHolder) holder).bind(row);
+        }
+    }
+
+    @Override
+    public void onBindViewHolder(@NonNull RecyclerView.ViewHolder holder, int position,
+            @NonNull List<Object> payloads) {
+        if (!payloads.isEmpty() && holder instanceof RowHolder
+                && payloads.contains(PAYLOAD_THUMBNAIL)) {
+            Row row = getItem(position);
+            if (row != null && !row.isHeading() && row.file != null) {
+                ((RowHolder) holder).bindThumbnail(row);
+                return;
             }
         }
-
-        // Tree Indentation spacer
-        int indentWidth = row.depth * dp(parent.getContext(), 14);
-        ViewGroup.LayoutParams spacerParams = holder.indentSpacer.getLayoutParams();
-        if (spacerParams.width != indentWidth) {
-            spacerParams.width = indentWidth;
-            holder.indentSpacer.setLayoutParams(spacerParams);
-        }
-
-        // Tree expand/collapse chevron
-        final ImageView chevronView = holder.treeChevron;
-        if (row.isDirectory) {
-            chevronView.setVisibility(View.VISIBLE);
-            chevronView.setImageResource(row.isExpanded
-                    ? R.drawable.ic_tree_collapse
-                    : R.drawable.ic_tree_expand);
-            chevronView.setRotation(0f);
-            chevronView.setOnClickListener(v -> {
-                if (animationsEnabled) {
-                    chevronView.animate()
-                            .rotationBy(row.isExpanded ? -90f : 90f)
-                            .setDuration(160)
-                            .setInterpolator(new DecelerateInterpolator())
-                            .start();
-                }
-                if (chevronClickListener != null) {
-                    chevronClickListener.onChevronClick(row.file);
-                }
-            });
-        } else {
-            // Invisible keeps column alignment so file names line up with folders
-            chevronView.setVisibility(View.INVISIBLE);
-            chevronView.setOnClickListener(null);
-        }
-
-        if (animationsEnabled && position > lastAnimatedPosition && position < 30) {
-            lastAnimatedPosition = position;
-            view.setAlpha(0.25f);
-            view.setTranslationY(dp(parent.getContext(), 5));
-            view.animate()
-                    .alpha(1.0f)
-                    .translationY(0f)
-                    .setDuration(160)
-                    .setInterpolator(new DecelerateInterpolator())
-                    .start();
-        } else {
-            view.setAlpha(1.0f);
-            view.setTranslationY(0f);
-        }
-
-        holder.name.setText(row.file.getName());
-        holder.details.setText(row.details);
-        holder.selectionMark.setVisibility(row.selected ? View.VISIBLE : View.GONE);
-        int iconResource = iconFor(row.file);
-        holder.icon.setImageResource(iconResource);
-
-        String thumbnailKey = thumbnailKey(row.file);
-        if (thumbnailKey == null) {
-            holder.icon.setTag(null);
-        } else {
-            Bitmap cached = thumbnailCache.get(thumbnailKey);
-            if (cached != null) {
-                holder.icon.setImageBitmap(cached);
-                holder.icon.setTag(thumbnailKey);
-            } else {
-                holder.icon.setTag(thumbnailKey);
-                requestThumbnail(row.file, thumbnailKey);
-            }
-        }
-        return view;
+        super.onBindViewHolder(holder, position, payloads);
     }
 
     public void close() {
@@ -265,24 +244,179 @@ public final class FileListAdapter extends BaseAdapter {
         thumbnailCache.evictAll();
     }
 
+    private final class RowHolder extends RecyclerView.ViewHolder {
+        final View indentSpacer;
+        final ImageView treeChevron;
+        final ImageView icon;
+        final ImageView selectionMark;
+        final TextView name;
+        final TextView details;
+        Boolean lastExpanded;
+        String boundKey;
+
+        RowHolder(View view) {
+            super(view);
+            indentSpacer = view.findViewById(R.id.indentSpacer);
+            treeChevron = view.findViewById(R.id.treeChevron);
+            icon = view.findViewById(R.id.fileIcon);
+            selectionMark = view.findViewById(R.id.selectionMark);
+            name = view.findViewById(R.id.fileName);
+            details = view.findViewById(R.id.fileDetails);
+
+            itemView.setOnClickListener(clicked -> {
+                int position = getBindingAdapterPosition();
+                if (position != RecyclerView.NO_POSITION && itemClickListener != null) {
+                    Row row = getItem(position);
+                    if (!row.isHeading() && row.file != null) {
+                        itemClickListener.onItemClick(row.file);
+                    }
+                }
+            });
+            itemView.setOnLongClickListener(clicked -> {
+                int position = getBindingAdapterPosition();
+                if (position != RecyclerView.NO_POSITION && itemLongClickListener != null) {
+                    Row row = getItem(position);
+                    if (!row.isHeading() && row.file != null) {
+                        return itemLongClickListener.onItemLongClick(row.file);
+                    }
+                }
+                return false;
+            });
+            treeChevron.setOnClickListener(clicked -> {
+                int position = getBindingAdapterPosition();
+                if (position != RecyclerView.NO_POSITION && chevronClickListener != null) {
+                    Row row = getItem(position);
+                    if (!row.isHeading() && row.file != null) {
+                        chevronClickListener.onChevronClick(row.file);
+                    }
+                }
+            });
+        }
+
+        void bind(Row row) {
+            Context context = itemView.getContext();
+            String rowKey = row.key();
+            boolean sameItem = rowKey.equals(boundKey);
+            int indentWidth = row.depth * dp(context, 14);
+            ViewGroup.LayoutParams spacerParams = indentSpacer.getLayoutParams();
+            if (spacerParams.width != indentWidth) {
+                spacerParams.width = indentWidth;
+                indentSpacer.setLayoutParams(spacerParams);
+            }
+
+            if (row.treeNode && row.isDirectory) {
+                treeChevron.setVisibility(View.VISIBLE);
+                float targetRotation = row.isExpanded ? 90f : 0f;
+                boolean animateChevron = animationsEnabled && sameItem && lastExpanded != null
+                        && lastExpanded != row.isExpanded;
+                if (animateChevron) {
+                    treeChevron.animate()
+                            .rotation(targetRotation)
+                            .setDuration(160)
+                            .setInterpolator(new DecelerateInterpolator())
+                            .start();
+                } else {
+                    treeChevron.animate().cancel();
+                    treeChevron.setRotation(targetRotation);
+                }
+                lastExpanded = row.isExpanded;
+                treeChevron.setContentDescription(
+                        row.isExpanded ? "Collapse folder" : "Expand folder");
+            } else {
+                treeChevron.animate().cancel();
+                treeChevron.setRotation(0f);
+                treeChevron.setVisibility(View.INVISIBLE);
+                treeChevron.setContentDescription(null);
+                lastExpanded = null;
+            }
+            boundKey = rowKey;
+
+            itemView.setSelected(row.selected);
+            name.setText(row.file.getName());
+            details.setText(row.details);
+            selectionMark.setVisibility(row.selected ? View.VISIBLE : View.GONE);
+
+            String thumbnailKey = thumbnailKey(row.file);
+            int iconResource = iconFor(row.file);
+            if (thumbnailKey == null) {
+                icon.setTag(null);
+                icon.setImageResource(iconResource);
+            } else {
+                icon.setTag(thumbnailKey);
+                Bitmap cached = thumbnailCache.get(thumbnailKey);
+                if (cached != null) {
+                    icon.setImageBitmap(cached);
+                } else {
+                    icon.setImageResource(iconResource);
+                    requestThumbnail(row.file, thumbnailKey);
+                }
+            }
+        }
+
+        void bindThumbnail(Row row) {
+            String key = thumbnailKey(row.file);
+            if (key == null || !key.equals(icon.getTag())) {
+                return;
+            }
+            Bitmap cached = thumbnailCache.get(key);
+            if (cached != null) {
+                icon.setImageBitmap(cached);
+            }
+        }
+    }
+
+    private static final class HeadingHolder extends RecyclerView.ViewHolder {
+        final TextView heading;
+
+        HeadingHolder(View view) {
+            super(view);
+            heading = (TextView) view;
+        }
+
+        void bind(Row row) {
+            heading.setText(row.title);
+            itemView.setSelected(false);
+        }
+    }
+
     private void requestThumbnail(File file, String key) {
-        if (!pendingThumbnails.add(key)) {
+        if (closed || !pendingThumbnails.add(key)) {
             return;
         }
-        thumbnailExecutor.execute(() -> {
-            Bitmap bitmap = createThumbnail(file);
-            if (bitmap != null) {
-                thumbnailCache.put(key, bitmap);
-            }
-            pendingThumbnails.remove(key);
-            if (bitmap != null && !closed) {
+        try {
+            thumbnailExecutor.execute(() -> {
+                Bitmap bitmap = createThumbnail(file);
+                if (bitmap != null) {
+                    thumbnailCache.put(key, bitmap);
+                }
+                pendingThumbnails.remove(key);
+                if (bitmap == null || closed) {
+                    return;
+                }
+                String path = file.getAbsolutePath();
                 mainHandler.post(() -> {
-                    if (!closed) {
-                        notifyDataSetChanged();
+                    if (closed) {
+                        return;
+                    }
+                    int position = findPositionForPath(path);
+                    if (position != RecyclerView.NO_POSITION) {
+                        notifyItemChanged(position, PAYLOAD_THUMBNAIL);
                     }
                 });
+            });
+        } catch (RejectedExecutionException ignored) {
+            pendingThumbnails.remove(key);
+        }
+    }
+
+    private int findPositionForPath(String path) {
+        for (int position = 0; position < getItemCount(); position++) {
+            File file = getItem(position).file;
+            if (file != null && path.equals(file.getAbsolutePath())) {
+                return position;
             }
-        });
+        }
+        return RecyclerView.NO_POSITION;
     }
 
     private Bitmap createThumbnail(File file) {
@@ -406,6 +540,9 @@ public final class FileListAdapter extends BaseAdapter {
     }
 
     private String thumbnailKey(File file) {
+        if (file == null || file.isDirectory()) {
+            return null;
+        }
         String extension = extension(file);
         if (!isImage(extension) && !isVideo(extension) && !"pdf".equals(extension)) {
             return null;
@@ -458,23 +595,5 @@ public final class FileListAdapter extends BaseAdapter {
 
     private int dp(Context context, int value) {
         return Math.round(value * context.getResources().getDisplayMetrics().density);
-    }
-
-    private static final class RowHolder {
-        final View indentSpacer;
-        final ImageView treeChevron;
-        final ImageView icon;
-        final ImageView selectionMark;
-        final TextView name;
-        final TextView details;
-
-        RowHolder(View view) {
-            indentSpacer = view.findViewById(R.id.indentSpacer);
-            treeChevron = view.findViewById(R.id.treeChevron);
-            icon = view.findViewById(R.id.fileIcon);
-            selectionMark = view.findViewById(R.id.selectionMark);
-            name = view.findViewById(R.id.fileName);
-            details = view.findViewById(R.id.fileDetails);
-        }
     }
 }

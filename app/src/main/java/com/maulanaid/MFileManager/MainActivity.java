@@ -51,7 +51,6 @@ import android.widget.ImageView;
 import android.widget.ImageButton;
 import android.text.InputType;
 import android.widget.LinearLayout;
-import android.widget.ListView;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -64,6 +63,9 @@ import androidx.appcompat.app.AppCompatDelegate;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.activity.OnBackPressedCallback;
 import androidx.appcompat.widget.PopupMenu;
+import androidx.recyclerview.widget.DefaultItemAnimator;
+import androidx.recyclerview.widget.LinearLayoutManager;
+import androidx.recyclerview.widget.RecyclerView;
 import com.google.android.gms.oss.licenses.OssLicensesMenuActivity;
 
 import java.io.File;
@@ -123,7 +125,9 @@ public class MainActivity extends AppCompatActivity {
     private static final String PREF_FTP_URLS = "ftp_share_urls";
     private static final String PREF_FTP_ERROR = "ftp_share_error";
 
-    private ListView fileList;
+    private RecyclerView fileList;
+    private LinearLayoutManager fileLayoutManager;
+    private RecyclerView.ItemAnimator fileItemAnimator;
     private FileListAdapter adapter;
     private boolean treeViewEnabled = true;
     private boolean animationsEnabled = true;
@@ -139,9 +143,13 @@ public class MainActivity extends AppCompatActivity {
     private File currentDirectory;
     private final Set<File> selectedFiles = new LinkedHashSet<>();
     private final List<File> clipboardFiles = new ArrayList<>();
-    private final List<File> allFiles = new ArrayList<>();
     private final List<File> rowFiles = new ArrayList<>();
     private final List<FileListAdapter.Row> displayRows = new ArrayList<>();
+    private File pendingFocusDirectory;
+    private File lastRenderedDirectory;
+    private String lastRenderedQuery = "";
+    private boolean lastRenderedTreeView;
+    private boolean hasRenderedOnce;
     private final ExecutorService archiveExecutor = Executors.newSingleThreadExecutor();
     private final ExecutorService renderExecutor = Executors.newSingleThreadExecutor();
     private final java.util.concurrent.atomic.AtomicInteger renderGeneration = new java.util.concurrent.atomic.AtomicInteger(
@@ -180,11 +188,19 @@ public class MainActivity extends AppCompatActivity {
         foldersFirst = preferences.getBoolean(PREF_FOLDERS_FIRST, true);
         treeViewEnabled = preferences.getBoolean(PREF_TREE_VIEW, true);
         animationsEnabled = preferences.getBoolean(PREF_ANIMATIONS, true);
+
         fileList = findViewById(R.id.fileList);
+        fileLayoutManager = new LinearLayoutManager(this);
+        fileList.setLayoutManager(fileLayoutManager);
+        fileItemAnimator = createFileItemAnimator();
         adapter = new FileListAdapter(this);
         adapter.setOnChevronClickListener(this::toggleExpandedFolder);
+        adapter.setOnItemClickListener(this::handleFileClick);
+        adapter.setOnItemLongClickListener(this::handleFileLongClick);
         adapter.setAnimationsEnabled(animationsEnabled);
+        fileList.setItemAnimator(animationsEnabled ? fileItemAnimator : null);
         fileList.setAdapter(adapter);
+
         pathInput = findViewById(R.id.pathInput);
         searchInput = findViewById(R.id.searchInput);
         httpShareStatus = findViewById(R.id.httpShareStatus);
@@ -200,46 +216,25 @@ public class MainActivity extends AppCompatActivity {
                     currentDirectory = savedDirectory;
                 }
             }
-        }
-
-        fileList.setOnItemClickListener((parent, view, position, id) -> {
-            File clickedFile = rowFiles.get(position);
-            if (clickedFile == null) {
-                return;
+            ArrayList<String> savedExpanded = savedInstanceState.getStringArrayList("expanded_paths");
+            if (savedExpanded != null) {
+                expandedPaths.addAll(savedExpanded);
             }
-            if (!selectedFiles.isEmpty()) {
-                toggleSelectedFile(clickedFile);
-                return;
-            }
-            if (clickedFile.isDirectory()) {
-                lastClickedDirectory = clickedFile;
-                if (treeViewEnabled) {
-                    toggleExpandedFolder(clickedFile);
-                } else {
-                    currentDirectory = clickedFile;
-                    selectedFiles.clear();
-                    showFiles();
+            ArrayList<String> savedStack = savedInstanceState.getStringArrayList("expansion_stack");
+            if (savedStack != null) {
+                for (String path : savedStack) {
+                    if (expandedPaths.contains(path)) {
+                        File folder = new File(path);
+                        expansionStack.remove(folder);
+                        expansionStack.add(folder);
+                    }
                 }
-            } else {
-                lastClickedDirectory = clickedFile.getParentFile();
-                openFile(clickedFile);
             }
-        });
-        fileList.setOnItemLongClickListener((parent, view, position, id) -> {
-            File clickedFile = rowFiles.get(position);
-            if (clickedFile == null) {
-                return false;
+            String savedClicked = savedInstanceState.getString("last_clicked_directory");
+            if (savedClicked != null) {
+                lastClickedDirectory = new File(savedClicked);
             }
-            if (!selectedFiles.contains(clickedFile)) {
-                selectedFiles.add(clickedFile);
-                updateSelection();
-                fileList.post(this::renderFiles);
-                return true;
-            }
-            updateSelection();
-            showContextMenu(clickedFile);
-            return true;
-        });
+        }
 
         findViewById(R.id.settingsButton).setOnClickListener(this::showSettingsMenu);
         findViewById(R.id.goButton).setOnClickListener(view -> goToPath());
@@ -327,16 +322,76 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onSaveInstanceState(Bundle outState) {
         outState.putString("current_directory", currentDirectory.getAbsolutePath());
+        outState.putStringArrayList("expanded_paths", new ArrayList<>(expandedPaths));
+        ArrayList<String> stack = new ArrayList<>();
+        for (File folder : expansionStack) {
+            stack.add(folder.getAbsolutePath());
+        }
+        outState.putStringArrayList("expansion_stack", stack);
+        if (lastClickedDirectory != null) {
+            outState.putString("last_clicked_directory", lastClickedDirectory.getAbsolutePath());
+        }
         super.onSaveInstanceState(outState);
     }
 
     @Override
     protected void onDestroy() {
+        renderGeneration.incrementAndGet();
+        mainHandler.removeCallbacksAndMessages(null);
         if (adapter != null) {
             adapter.close();
         }
         archiveExecutor.shutdownNow();
+        renderExecutor.shutdownNow();
         super.onDestroy();
+    }
+
+    private RecyclerView.ItemAnimator createFileItemAnimator() {
+        DefaultItemAnimator animator = new DefaultItemAnimator();
+        animator.setAddDuration(180);
+        animator.setRemoveDuration(140);
+        animator.setMoveDuration(200);
+        animator.setChangeDuration(120);
+        // Selection and thumbnail updates should not flash the whole row.
+        animator.setSupportsChangeAnimations(false);
+        return animator;
+    }
+
+    private void applyAnimationPreference() {
+        adapter.setAnimationsEnabled(animationsEnabled);
+        fileList.setItemAnimator(animationsEnabled ? fileItemAnimator : null);
+    }
+
+    private void handleFileClick(File clickedFile) {
+        if (!selectedFiles.isEmpty()) {
+            toggleSelectedFile(clickedFile);
+            return;
+        }
+        if (clickedFile.isDirectory()) {
+            lastClickedDirectory = clickedFile;
+            if (treeViewEnabled) {
+                toggleExpandedFolder(clickedFile);
+            } else {
+                currentDirectory = clickedFile;
+                selectedFiles.clear();
+                showFiles();
+            }
+        } else {
+            lastClickedDirectory = clickedFile.getParentFile();
+            openFile(clickedFile);
+        }
+    }
+
+    private boolean handleFileLongClick(File clickedFile) {
+        if (!selectedFiles.contains(clickedFile)) {
+            selectedFiles.add(clickedFile);
+            updateSelection();
+            renderFiles();
+            return true;
+        }
+        updateSelection();
+        showContextMenu(clickedFile);
+        return true;
     }
 
     private void showUserAgreement() {
@@ -487,7 +542,7 @@ public class MainActivity extends AppCompatActivity {
         animItem.setOnMenuItemClickListener(item -> {
             animationsEnabled = !animationsEnabled;
             preferences.edit().putBoolean(PREF_ANIMATIONS, animationsEnabled).apply();
-            adapter.setAnimationsEnabled(animationsEnabled);
+            applyAnimationPreference();
             return true;
         });
 
@@ -616,15 +671,13 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void showFiles() {
-        File[] files = currentDirectory.listFiles();
-        allFiles.clear();
-        if (files != null) {
-            allFiles.addAll(Arrays.asList(files));
-        }
+        pendingFocusDirectory = null;
         String path = currentDirectory.getAbsolutePath();
         if (!path.equals(pathInput.getText().toString())) {
             pathInput.setText(path);
         }
+        // Directory listing now happens on the render thread, so opening a folder
+        // never blocks the UI.
         renderFiles();
     }
 
@@ -646,18 +699,27 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void focusDirectory(File dir) {
-        if (dir == null) {
+        if (dir != null) {
+            pendingFocusDirectory = dir;
+        }
+    }
+
+    private void applyPendingFocus() {
+        File focus = pendingFocusDirectory;
+        if (focus == null || fileLayoutManager == null) {
             return;
         }
-        fileList.post(() -> {
-            for (int i = 0; i < rowFiles.size(); i++) {
-                File file = rowFiles.get(i);
-                if (file != null && file.equals(dir)) {
-                    fileList.setSelection(i);
-                    break;
-                }
+        for (int i = 0; i < displayRows.size(); i++) {
+            File file = displayRows.get(i).getFile();
+            if (file != null && file.equals(focus)) {
+                fileLayoutManager.scrollToPositionWithOffset(i, 0);
+                pendingFocusDirectory = null;
+                return;
             }
-        });
+        }
+        // The target is no longer part of the committed list; do not let a stale
+        // focus request scroll the list later.
+        pendingFocusDirectory = null;
     }
 
     // ──────────────────────────────────────────────────────────
@@ -673,13 +735,15 @@ public class MainActivity extends AppCompatActivity {
         final String grp = grouping;
         final Set<String> expanded = new LinkedHashSet<>(expandedPaths);
         final Set<File> selected = new LinkedHashSet<>(selectedFiles);
-        final List<File> flatFiles = new ArrayList<>(allFiles);
         final Comparator<File> cmp = fileComparator();
         final SimpleDateFormat dateFmt = new SimpleDateFormat("MMM d", Locale.getDefault());
-        // Capture current scroll position so we can restore it after the render
-        final int savedScrollPos = fileList.getFirstVisiblePosition();
-        final View savedTopChild = fileList.getChildAt(0);
-        final int savedScrollOffset = (savedTopChild != null) ? savedTopChild.getTop() : 0;
+
+        // A different folder, query, or view mode should not make the whole list flash.
+        final boolean resetScroll = !hasRenderedOnce
+                || !dir.equals(lastRenderedDirectory)
+                || !query.equals(lastRenderedQuery)
+                || treeView != lastRenderedTreeView;
+        final boolean animateChanges = hasRenderedOnce && !resetScroll;
 
         renderExecutor.execute(() -> {
             // Abort if a newer render has been requested
@@ -697,10 +761,13 @@ public class MainActivity extends AppCompatActivity {
                         dirCache, dateFmt);
             } else {
                 List<File> filtered = new ArrayList<>();
-                for (File f : flatFiles) {
-                    if (query.isEmpty()
-                            || f.getName().toLowerCase(Locale.ROOT).contains(query)) {
-                        filtered.add(f);
+                File[] children = dir.listFiles();
+                if (children != null) {
+                    for (File f : children) {
+                        if (query.isEmpty()
+                                || f.getName().toLowerCase(Locale.ROOT).contains(query)) {
+                            filtered.add(f);
+                        }
                     }
                 }
                 filtered.sort(cmp);
@@ -738,18 +805,57 @@ public class MainActivity extends AppCompatActivity {
                 return; // discard if superseded
 
             mainHandler.post(() -> {
+                if (renderGeneration.get() != gen) {
+                    return;
+                }
                 displayRows.clear();
                 displayRows.addAll(rows);
                 rowFiles.clear();
                 rowFiles.addAll(rowFilesList);
-                adapter.setRows(displayRows);
                 updateSelection();
-                // Restore scroll so the view doesn't jump to the top
-                if (savedScrollPos >= 0) {
-                    fileList.setSelectionFromTop(savedScrollPos, savedScrollOffset);
-                }
+                submitRowsWithAnimation(rows, animateChanges, () -> {
+                    if (renderGeneration.get() != gen) {
+                        return;
+                    }
+                    hasRenderedOnce = true;
+                    lastRenderedDirectory = dir;
+                    lastRenderedQuery = query;
+                    lastRenderedTreeView = treeView;
+                    restoreScrollAfterRender(resetScroll);
+                    applyPendingFocus();
+                });
             });
         });
+    }
+
+    private void submitRowsWithAnimation(List<FileListAdapter.Row> rows, boolean animateChanges,
+            Runnable onCommit) {
+        if (!animationsEnabled) {
+            fileList.setItemAnimator(null);
+            adapter.submitRows(rows, onCommit);
+            return;
+        }
+        if (animateChanges) {
+            // Only inserted/removed rows animate (for example the children of a
+            // folder that was just expanded).
+            fileList.setItemAnimator(fileItemAnimator);
+            adapter.submitRows(rows, onCommit);
+            return;
+        }
+        // Folder navigation, search, and the first render replace most of the list;
+        // swap it without animating every row. Keep the animator detached until the
+        // next update that should animate, so RecyclerView lays this swap out flat.
+        fileList.setItemAnimator(null);
+        adapter.submitRows(rows, onCommit);
+    }
+
+    private void restoreScrollAfterRender(boolean resetScroll) {
+        if (!resetScroll || fileLayoutManager == null) {
+            // RecyclerView keeps the first visible row in place when DiffUtil inserts
+            // or removes rows around it, so expansions never make the list jump.
+            return;
+        }
+        fileLayoutManager.scrollToPositionWithOffset(0, 0);
     }
 
     /**
@@ -929,8 +1035,10 @@ public class MainActivity extends AppCompatActivity {
         }
         currentDirectory = requested;
         selectedFiles.clear();
+        pendingFocusDirectory = null;
         searchInput.setText("");
         showFiles();
+        scrollToTop();
     }
 
     private void goUp() {
@@ -974,8 +1082,16 @@ public class MainActivity extends AppCompatActivity {
     private void goHome() {
         currentDirectory = homeDirectory;
         selectedFiles.clear();
+        pendingFocusDirectory = null;
         searchInput.setText("");
         showFiles();
+        scrollToTop();
+    }
+
+    private void scrollToTop() {
+        if (fileLayoutManager != null) {
+            fileLayoutManager.scrollToPositionWithOffset(0, 0);
+        }
     }
 
     private void showCreateMenu(View anchor) {

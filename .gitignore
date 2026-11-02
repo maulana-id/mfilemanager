@@ -2,3 +2,6 @@ build
 .gradle
 .vscode
 local.properties
+screenshots/
+docs
+scripts

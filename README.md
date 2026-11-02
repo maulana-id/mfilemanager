@@ -7,9 +7,10 @@ A simple Android file manager for browsing shared storage and performing basic f
 ## Features
 
 - Browse folders and files, with folders listed first.
-- Use icon-only Home and Up controls to return to the starting storage folder or its parent.
+- Use the floating Home and Up rail at the bottom-right to return to the starting storage folder or its parent with one hand; the custom path field stays at the top.
 - Enter an absolute or current-folder-relative path to jump directly to a directory.
 - Search names in the current folder.
+- Expand folders inline in a tree view, with per-row insert and remove animations instead of reloading the whole list.
 - Group results by file type or modified date, or show one ungrouped list.
 - Sort by name, modified date, or extension, with an optional folders-first setting.
 - Select multiple files and folders to copy, paste, or delete them together.
@@ -19,7 +20,7 @@ A simple Android file manager for browsing shared storage and performing basic f
 - Open files with a compatible installed app through Android's app chooser.
 - Identify folders and common file types by icon; image, video, and PDF files show small generated previews when supported.
 - Confirm before recursively deleting selected files or folders.
-- Switch between light and dark themes.
+- Switch between VS Code-inspired light and dark color themes.
 - Request storage access according to the Android version.
 
 ## First-Run Acknowledgement
@@ -88,6 +89,19 @@ Debug APKs are signed with the standard debug key and can be installed for local
 adb install -r app/build/outputs/apk/debug/MFIle-Manager-universal-debug.apk
 ```
 
+## Emulator and Screenshots (CLI)
+
+The app can be run and captured without Android Studio. Gradle builds the APK; the Android SDK emulator runs it; `adb` installs, taps, screenshots, and records it. See [docs/EMULATOR_GUIDE.md](docs/EMULATOR_GUIDE.md) for the step-by-step workflow and [scripts/android-emulator.sh](scripts/android-emulator.sh) for a helper that wraps `sdkmanager`, `avdmanager`, `emulator`, and `adb`.
+
+```sh
+./scripts/android-emulator.sh setup
+./scripts/android-emulator.sh start --window
+./scripts/android-emulator.sh install
+./scripts/android-emulator.sh ui
+./scripts/android-emulator.sh tap 975 1841
+./scripts/android-emulator.sh shot
+```
+
 To produce release outputs:
 
 ```sh
@@ -129,15 +143,17 @@ Open **Settings** in the top-right corner to configure the list:
 - **Group by:** none, file type, or modified date.
 - **Sort by:** name, modified date (newest first), or extension.
 - **Folders first:** show directories before files.
-- **Dark theme:** switch between light and dark appearance.
+- **Tree view:** expand folders inline; expanding or collapsing animates only the affected rows.
+- **Smooth animations:** enable or disable row insertion, removal, movement, and folder-chevron animations.
+- **Dark theme:** switch between the VS Code Light+ and Dark+ inspired palettes.
 
-These settings are saved on the device. The search field filters the current folder by name. Use the path field and **Go** button to open an absolute path, or a relative path from the current folder. The **Up** button moves to the parent directory.
+These settings are saved on the device. The search field filters the current folder by name. Use the path field and **Go** button at the top to open an absolute path, or a relative path from the current folder. The **Home** and **Up** buttons sit in the floating rail at the bottom-right, within easy reach for one-handed use; **Up** moves to the parent directory.
 
 Tap a folder to open it or a file to open it with a compatible app. The **Create** toolbar control offers a new folder or empty file. The first long-press selects an item; long-press that selected item again to open the icon-and-label action menu. For a single file, **Open as...** lets you choose a MIME type such as text, audio, video, image, PDF, APK, archive, or any type. **Rename** and **Properties** are available for a single selected item. Once selection starts, tap rows to add or remove them; long-press an unselected row to add it, then long-press a selected row to open the menu. The menu includes copy, paste, delete, select-all, and clear-selection actions. Paste is also available from Settings when the list is empty. The selection indicator shows the current count.
 
 The phone's Back button navigates to the parent directory. At the storage root it shows an exit prompt; double-press Back within two seconds to exit the app.
 
-Rows show a format-specific icon, modified date, and file size. Images, videos, and PDFs generate small previews on a background executor; unsupported or unreadable files keep their format icon. Previews are cached in memory while the screen is open.
+Rows show a format-specific icon, modified date, and file size. Images, videos, and PDFs generate small previews on a background executor; unsupported or unreadable files keep their format icon. Previews are cached in memory while the screen is open. The list updates with a diff, so selecting a row or loading a thumbnail does not rebuild or re-animate unrelated rows.
 
 Pasting multiple items asks about each conflicting destination. Choose **Replace** or **Skip** for that item, **Replace all** or **Skip all** for the remaining conflicts, or **Cancel** to stop; any items already processed remain processed. Replacing a folder merges it, overwrites matching files, and keeps unrelated destination files. Deletion asks for confirmation because folders are removed recursively.
 
