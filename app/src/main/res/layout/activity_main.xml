@@ -28,6 +28,18 @@
             android:textSize="14sp" />
 
         <ImageButton
+            android:id="@+id/drivesButton"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="Storage devices"
+            android:padding="10dp"
+            android:scaleType="fitCenter"
+            android:src="@drawable/ic_storage_devices"
+            app:tint="@color/vscode_icon"
+            android:tooltipText="Storage devices" />
+
+        <ImageButton
             android:id="@+id/settingsButton"
             android:layout_width="40dp"
             android:layout_height="40dp"

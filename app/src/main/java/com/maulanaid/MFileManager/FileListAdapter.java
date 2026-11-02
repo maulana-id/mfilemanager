@@ -33,6 +33,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.animation.DecelerateInterpolator;
 import android.widget.ImageView;
+import android.widget.ProgressBar;
 import android.widget.TextView;
 
 import androidx.annotation.NonNull;
@@ -76,10 +77,14 @@ public final class FileListAdapter extends ListAdapter<FileListAdapter.Row, Recy
         final boolean isExpanded;
         final boolean hasChildren;
         final boolean treeNode;
+        final boolean isStorageDevice;
+        final int storageUsagePercent;
+        final int customIcon;
 
         private Row(File file, String title, String details, boolean selected,
                 int depth, boolean isDirectory, boolean isExpanded, boolean hasChildren,
-                boolean treeNode) {
+                boolean treeNode, boolean isStorageDevice, int storageUsagePercent,
+                int customIcon) {
             this.file = file;
             this.title = title;
             this.details = details;
@@ -89,21 +94,31 @@ public final class FileListAdapter extends ListAdapter<FileListAdapter.Row, Recy
             this.isExpanded = isExpanded;
             this.hasChildren = hasChildren;
             this.treeNode = treeNode;
+            this.isStorageDevice = isStorageDevice;
+            this.storageUsagePercent = storageUsagePercent;
+            this.customIcon = customIcon;
         }
 
         public static Row file(File file, String details, boolean selected) {
             return new Row(file, null, details, selected, 0,
-                    file != null && file.isDirectory(), false, false, false);
+                    file != null && file.isDirectory(), false, false, false, false, 0, 0);
         }
 
         public static Row treeNode(File file, String details, boolean selected,
                 int depth, boolean isDirectory, boolean isExpanded, boolean hasChildren) {
             return new Row(file, null, details, selected, depth, isDirectory, isExpanded,
-                    hasChildren, true);
+                    hasChildren, true, false, 0, 0);
+        }
+
+        public static Row storageDevice(File file, String title, String details,
+                int usagePercent, int iconRes, boolean selected, int depth, boolean hasChildren,
+                boolean isExpanded, boolean treeNode) {
+            return new Row(file, title, details, selected, depth, true, isExpanded,
+                    hasChildren, treeNode, true, usagePercent, iconRes);
         }
 
         public static Row heading(String title) {
-            return new Row(null, title, null, false, 0, false, false, false, false);
+            return new Row(null, title, null, false, 0, false, false, false, false, false, 0, 0);
         }
 
         public boolean isHeading() {
@@ -116,7 +131,7 @@ public final class FileListAdapter extends ListAdapter<FileListAdapter.Row, Recy
 
         /** Stable identity used by DiffUtil and RecyclerView stable ids. */
         public String key() {
-            return isHeading() ? "heading:" + title : file.getAbsolutePath();
+            return isHeading() ? "heading:" + title : (isStorageDevice ? "storage:" + file.getAbsolutePath() : file.getAbsolutePath());
         }
 
         boolean contentsEqual(Row other) {
@@ -126,6 +141,9 @@ public final class FileListAdapter extends ListAdapter<FileListAdapter.Row, Recy
                     && isExpanded == other.isExpanded
                     && hasChildren == other.hasChildren
                     && treeNode == other.treeNode
+                    && isStorageDevice == other.isStorageDevice
+                    && storageUsagePercent == other.storageUsagePercent
+                    && customIcon == other.customIcon
                     && Objects.equals(title, other.title)
                     && Objects.equals(details, other.details);
         }
@@ -251,6 +269,7 @@ public final class FileListAdapter extends ListAdapter<FileListAdapter.Row, Recy
         final ImageView selectionMark;
         final TextView name;
         final TextView details;
+        final ProgressBar storageUsageBar;
         Boolean lastExpanded;
         String boundKey;
 
@@ -262,6 +281,7 @@ public final class FileListAdapter extends ListAdapter<FileListAdapter.Row, Recy
             selectionMark = view.findViewById(R.id.selectionMark);
             name = view.findViewById(R.id.fileName);
             details = view.findViewById(R.id.fileDetails);
+            storageUsageBar = view.findViewById(R.id.storageUsageBar);
 
             itemView.setOnClickListener(clicked -> {
                 int position = getBindingAdapterPosition();
@@ -332,9 +352,25 @@ public final class FileListAdapter extends ListAdapter<FileListAdapter.Row, Recy
             boundKey = rowKey;
 
             itemView.setSelected(row.selected);
-            name.setText(row.file.getName());
+            String displayName = row.title != null ? row.title : (row.file != null ? row.file.getName() : "");
+            name.setText(displayName);
             details.setText(row.details);
             selectionMark.setVisibility(row.selected ? View.VISIBLE : View.GONE);
+
+            if (storageUsageBar != null) {
+                if (row.isStorageDevice) {
+                    storageUsageBar.setVisibility(View.VISIBLE);
+                    storageUsageBar.setProgress(Math.max(0, Math.min(100, row.storageUsagePercent)));
+                } else {
+                    storageUsageBar.setVisibility(View.GONE);
+                }
+            }
+
+            if (row.isStorageDevice || row.customIcon > 0) {
+                icon.setTag(null);
+                icon.setImageResource(row.customIcon > 0 ? row.customIcon : R.drawable.ic_storage_internal);
+                return;
+            }
 
             String thumbnailKey = thumbnailKey(row.file);
             int iconResource = iconFor(row.file);

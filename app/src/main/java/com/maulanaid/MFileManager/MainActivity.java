@@ -102,6 +102,7 @@ public class MainActivity extends AppCompatActivity {
     private static final String PREF_DARK_THEME = "dark_theme";
     private static final String PREF_TREE_VIEW = "tree_view_enabled";
     private static final String PREF_ANIMATIONS = "animations_enabled";
+    private static final String PREF_SHOW_HIDDEN = "show_hidden_files";
     private static final String GROUP_NONE = "none";
     private static final String GROUP_TYPE = "type";
     private static final String GROUP_DATE = "date";
@@ -160,6 +161,7 @@ public class MainActivity extends AppCompatActivity {
     private String sorting = SORT_NAME;
     private String searchQuery = "";
     private boolean foldersFirst = true;
+    private boolean showHiddenFiles = false;
     private boolean darkTheme;
     private long lastBackPressedAt = -1;
     private String pendingHttpSharePath;
@@ -188,6 +190,7 @@ public class MainActivity extends AppCompatActivity {
         foldersFirst = preferences.getBoolean(PREF_FOLDERS_FIRST, true);
         treeViewEnabled = preferences.getBoolean(PREF_TREE_VIEW, true);
         animationsEnabled = preferences.getBoolean(PREF_ANIMATIONS, true);
+        showHiddenFiles = preferences.getBoolean(PREF_SHOW_HIDDEN, false);
 
         fileList = findViewById(R.id.fileList);
         fileLayoutManager = new LinearLayoutManager(this);
@@ -236,6 +239,10 @@ public class MainActivity extends AppCompatActivity {
             }
         }
 
+        View drivesButton = findViewById(R.id.drivesButton);
+        if (drivesButton != null) {
+            drivesButton.setOnClickListener(view -> goToStorageDevices());
+        }
         findViewById(R.id.settingsButton).setOnClickListener(this::showSettingsMenu);
         findViewById(R.id.goButton).setOnClickListener(view -> goToPath());
         findViewById(R.id.homeButton).setOnClickListener(view -> goHome());
@@ -369,7 +376,7 @@ public class MainActivity extends AppCompatActivity {
         }
         if (clickedFile.isDirectory()) {
             lastClickedDirectory = clickedFile;
-            if (treeViewEnabled) {
+            if (treeViewEnabled && !StorageHelper.isStorageRoot(currentDirectory)) {
                 toggleExpandedFolder(clickedFile);
             } else {
                 currentDirectory = clickedFile;
@@ -519,6 +526,21 @@ public class MainActivity extends AppCompatActivity {
             return true;
         });
 
+        MenuItem drivesItem = popup.getMenu().add("Storage devices");
+        drivesItem.setOnMenuItemClickListener(item -> {
+            goToStorageDevices();
+            return true;
+        });
+
+        MenuItem hiddenFilesItem = popup.getMenu().add("Show hidden files");
+        hiddenFilesItem.setCheckable(true).setChecked(showHiddenFiles);
+        hiddenFilesItem.setOnMenuItemClickListener(item -> {
+            showHiddenFiles = !showHiddenFiles;
+            preferences.edit().putBoolean(PREF_SHOW_HIDDEN, showHiddenFiles).apply();
+            showFiles();
+            return true;
+        });
+
         MenuItem foldersItem = popup.getMenu().add("Folders first");
         foldersItem.setCheckable(true).setChecked(foldersFirst);
         foldersItem.setOnMenuItemClickListener(item -> {
@@ -592,10 +614,18 @@ public class MainActivity extends AppCompatActivity {
             }
         }
         if (selectedFiles.size() == 1 && !pressedFile.isDirectory()) {
-            actions.add(new ActionItem("Open with", R.drawable.ic_action_open,
-                    () -> openFile(pressedFile)));
+            actions.add(new ActionItem("Open with (App chooser)...", R.drawable.ic_action_open,
+                    () -> openWithExternalAppChooser(pressedFile)));
             actions.add(new ActionItem("Open as...", R.drawable.ic_action_open,
                     () -> showOpenAsDialog(pressedFile)));
+            actions.add(new ActionItem("Share via...", R.drawable.ic_action_share,
+                    () -> shareFiles(Collections.singletonList(pressedFile))));
+            actions.add(new ActionItem("Checksum (MD5 / SHA-256)", R.drawable.ic_file_code,
+                    () -> showChecksumDialog(pressedFile)));
+        } else if (selectedFiles.size() > 1) {
+            actions.add(new ActionItem("Share " + selectedFiles.size() + " files via...",
+                    R.drawable.ic_action_share,
+                    () -> shareFiles(new ArrayList<>(selectedFiles))));
         }
         if (selectedFiles.size() == 1) {
             if (pressedFile.getParentFile() != null) {
@@ -733,6 +763,7 @@ public class MainActivity extends AppCompatActivity {
         final File dir = currentDirectory;
         final String query = searchQuery;
         final String grp = grouping;
+        final boolean showHidden = showHiddenFiles;
         final Set<String> expanded = new LinkedHashSet<>(expandedPaths);
         final Set<File> selected = new LinkedHashSet<>(selectedFiles);
         final Comparator<File> cmp = fileComparator();
@@ -756,14 +787,40 @@ public class MainActivity extends AppCompatActivity {
             List<FileListAdapter.Row> rows = new ArrayList<>();
             List<File> rowFilesList = new ArrayList<>();
 
-            if (treeView) {
+            if (StorageHelper.isStorageRoot(dir)) {
+                List<StorageHelper.StorageDevice> devices = StorageHelper.getStorageDevices(MainActivity.this);
+                for (StorageHelper.StorageDevice dev : devices) {
+                    if (!query.isEmpty()
+                            && !dev.label.toLowerCase(Locale.ROOT).contains(query)
+                            && !dev.file.getName().toLowerCase(Locale.ROOT).contains(query)) {
+                        continue;
+                    }
+                    boolean isExpanded = treeView && expanded.contains(dev.file.getAbsolutePath());
+                    File[] children = cachedListFiles(dev.file, dirCache);
+                    boolean hasChildren = children != null && children.length > 0;
+
+                    rows.add(FileListAdapter.Row.storageDevice(
+                            dev.file, dev.label, dev.getFormattedDetails(),
+                            dev.usedPercent, dev.iconRes, selected.contains(dev.file),
+                            0, hasChildren, isExpanded, treeView));
+                    rowFilesList.add(dev.file);
+
+                    if (treeView && isExpanded) {
+                        buildTreeRows(dev.file, 1, query, expanded, selected, cmp, rows, rowFilesList,
+                                dirCache, dateFmt, showHidden);
+                    }
+                }
+            } else if (treeView) {
                 buildTreeRows(dir, 0, query, expanded, selected, cmp, rows, rowFilesList,
-                        dirCache, dateFmt);
+                        dirCache, dateFmt, showHidden);
             } else {
                 List<File> filtered = new ArrayList<>();
                 File[] children = dir.listFiles();
                 if (children != null) {
                     for (File f : children) {
+                        if (!showHidden && f.getName().startsWith(".")) {
+                            continue;
+                        }
                         if (query.isEmpty()
                                 || f.getName().toLowerCase(Locale.ROOT).contains(query)) {
                             filtered.add(f);
@@ -866,7 +923,7 @@ public class MainActivity extends AppCompatActivity {
             Comparator<File> cmp,
             List<FileListAdapter.Row> rows, List<File> rowFiles,
             Map<String, File[]> dirCache,
-            SimpleDateFormat dateFmt) {
+            SimpleDateFormat dateFmt, boolean showHidden) {
         File[] children = cachedListFiles(directory, dirCache);
         if (children == null)
             return;
@@ -875,6 +932,9 @@ public class MainActivity extends AppCompatActivity {
         childList.sort(cmp);
 
         for (File file : childList) {
+            if (!showHidden && file.getName().startsWith(".")) {
+                continue;
+            }
             boolean isDir = file.isDirectory();
             boolean matchesSearch = query.isEmpty()
                     || file.getName().toLowerCase(Locale.ROOT).contains(query);
@@ -894,7 +954,7 @@ public class MainActivity extends AppCompatActivity {
 
             if (isDir && isExpanded) {
                 buildTreeRows(file, depth + 1, query, expanded, selected,
-                        cmp, rows, rowFiles, dirCache, dateFmt);
+                        cmp, rows, rowFiles, dirCache, dateFmt, showHidden);
             }
         }
     }
@@ -937,16 +997,7 @@ public class MainActivity extends AppCompatActivity {
                     : "Folder";
             return count + "  " + modified;
         }
-        long size = file.length();
-        String sizeStr;
-        if (size < 1024) {
-            sizeStr = size + " B";
-        } else if (size < 1024L * 1024L) {
-            sizeStr = String.format(Locale.getDefault(), "%.1f KB", size / 1024.0);
-        } else {
-            sizeStr = String.format(Locale.getDefault(), "%.1f MB", size / (1024.0 * 1024.0));
-        }
-        return sizeStr + "  " + modified;
+        return StorageHelper.formatSize(file.length()) + "  " + modified;
     }
 
     /** Legacy fileDetails used outside of render (e.g. file info dialog). */
@@ -1029,11 +1080,22 @@ public class MainActivity extends AppCompatActivity {
             toast("Invalid folder path");
             return;
         }
-        if (!requested.isDirectory() || !requested.canRead()) {
+        if (StorageHelper.isStorageRoot(requested)) {
+            requested = new File(StorageHelper.STORAGE_ROOT_PATH);
+        } else if (!requested.isDirectory() || !requested.canRead()) {
             toast("Folder not found or cannot be read");
             return;
         }
         currentDirectory = requested;
+        selectedFiles.clear();
+        pendingFocusDirectory = null;
+        searchInput.setText("");
+        showFiles();
+        scrollToTop();
+    }
+
+    private void goToStorageDevices() {
+        currentDirectory = new File(StorageHelper.STORAGE_ROOT_PATH);
         selectedFiles.clear();
         pendingFocusDirectory = null;
         searchInput.setText("");
@@ -1068,7 +1130,16 @@ public class MainActivity extends AppCompatActivity {
 
         File previousDir = currentDirectory;
         File parent = currentDirectory.getParentFile();
-        if (parent != null && parent.canRead()) {
+
+        // The parent of default path (/storage/emulated/0) or /storage/emulated is /storage
+        if (currentDirectory.equals(homeDirectory)
+                || "/storage/emulated".equals(currentDirectory.getAbsolutePath())) {
+            parent = new File(StorageHelper.STORAGE_ROOT_PATH);
+        } else if (parent != null && "/storage/emulated".equals(parent.getAbsolutePath())) {
+            parent = new File(StorageHelper.STORAGE_ROOT_PATH);
+        }
+
+        if (parent != null && (parent.canRead() || StorageHelper.isStorageRoot(parent))) {
             currentDirectory = parent;
             lastClickedDirectory = parent;
             selectedFiles.clear();
@@ -1214,8 +1285,8 @@ public class MainActivity extends AppCompatActivity {
         String type = file.isDirectory() ? "Folder"
                 : fileExtension(file).isEmpty() ? "File" : fileExtension(file).toUpperCase(Locale.ROOT);
         String size = file.isDirectory()
-                ? file.listFiles() == null ? "Unavailable" : file.listFiles().length + " item(s)"
-                : formatFileSize(file.length());
+                ? "Calculating..."
+                : StorageHelper.formatSize(file.length());
         String modified = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
                 .format(new Date(file.lastModified()));
         String details = "Type: " + type
@@ -1224,21 +1295,181 @@ public class MainActivity extends AppCompatActivity {
                 + "\nReadable: " + (file.canRead() ? "Yes" : "No")
                 + "\nWritable: " + (file.canWrite() ? "Yes" : "No")
                 + "\n\nPath: " + file.getAbsolutePath();
-        new AlertDialog.Builder(this)
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
                 .setTitle(file.getName())
                 .setMessage(details)
                 .setPositiveButton("OK", null)
                 .show();
+
+        if (file.isDirectory()) {
+            Executors.newSingleThreadExecutor().execute(() -> {
+                long[] stats = calculateFolderStats(file);
+                String updatedSize = StorageHelper.formatSize(stats[0])
+                        + " (" + stats[1] + " file" + (stats[1] == 1 ? "" : "s")
+                        + ", " + stats[2] + " folder" + (stats[2] == 1 ? "" : "s") + ")";
+                mainHandler.post(() -> {
+                    if (dialog.isShowing()) {
+                        String updatedDetails = "Type: " + type
+                                + "\nSize: " + updatedSize
+                                + "\nModified: " + modified
+                                + "\nReadable: " + (file.canRead() ? "Yes" : "No")
+                                + "\nWritable: " + (file.canWrite() ? "Yes" : "No")
+                                + "\n\nPath: " + file.getAbsolutePath();
+                        dialog.setMessage(updatedDetails);
+                    }
+                });
+            });
+        }
+    }
+
+    private long[] calculateFolderStats(File dir) {
+        long totalBytes = 0;
+        long files = 0;
+        long folders = 0;
+        List<File> queue = new ArrayList<>();
+        queue.add(dir);
+        int maxItems = 50000;
+        while (!queue.isEmpty() && (files + folders) < maxItems) {
+            File current = queue.remove(queue.size() - 1);
+            File[] list = current.listFiles();
+            if (list != null) {
+                for (File child : list) {
+                    if (child.isDirectory()) {
+                        folders++;
+                        queue.add(child);
+                    } else {
+                        files++;
+                        totalBytes += child.length();
+                    }
+                }
+            }
+        }
+        return new long[]{totalBytes, files, folders};
+    }
+
+    private void shareFiles(List<File> files) {
+        if (files == null || files.isEmpty()) return;
+        List<File> fileOnlyList = new ArrayList<>();
+        for (File f : files) {
+            if (f != null && f.isFile()) {
+                fileOnlyList.add(f);
+            }
+        }
+        if (fileOnlyList.isEmpty()) {
+            toast("Folders cannot be shared directly. Compress to ZIP first.");
+            return;
+        }
+        try {
+            Intent intent = new Intent();
+            if (fileOnlyList.size() == 1) {
+                File f = fileOnlyList.get(0);
+                Uri uri = FileProvider.getUriForFile(this, getPackageName() + ".fileprovider", f);
+                intent.setAction(Intent.ACTION_SEND);
+                String ext = fileExtension(f);
+                String mimeType = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext);
+                if (mimeType == null) mimeType = "*/*";
+                intent.setType(mimeType);
+                intent.putExtra(Intent.EXTRA_STREAM, uri);
+            } else {
+                ArrayList<Uri> uris = new ArrayList<>();
+                for (File f : fileOnlyList) {
+                    uris.add(FileProvider.getUriForFile(this, getPackageName() + ".fileprovider", f));
+                }
+                intent.setAction(Intent.ACTION_SEND_MULTIPLE);
+                intent.setType("*/*");
+                intent.putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris);
+            }
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            startActivity(Intent.createChooser(intent, "Share via"));
+        } catch (Exception e) {
+            toast("Unable to share: " + e.getMessage());
+        }
+    }
+
+    private void showChecksumDialog(File file) {
+        if (!file.isFile() || !file.canRead()) {
+            toast("Cannot read file for checksum");
+            return;
+        }
+        AlertDialog progressDialog = new AlertDialog.Builder(this)
+                .setTitle("Calculating Checksum")
+                .setMessage("Computing MD5 and SHA-256 for\n" + file.getName() + "...")
+                .setCancelable(false)
+                .show();
+
+        Executors.newSingleThreadExecutor().execute(() -> {
+            try {
+                java.security.MessageDigest md5Digest = java.security.MessageDigest.getInstance("MD5");
+                java.security.MessageDigest sha256Digest = java.security.MessageDigest.getInstance("SHA-256");
+
+                try (FileInputStream fis = new FileInputStream(file)) {
+                    byte[] buffer = new byte[16384];
+                    int read;
+                    while ((read = fis.read(buffer)) != -1) {
+                        md5Digest.update(buffer, 0, read);
+                        sha256Digest.update(buffer, 0, read);
+                    }
+                }
+
+                String md5 = bytesToHex(md5Digest.digest());
+                String sha256 = bytesToHex(sha256Digest.digest());
+
+                mainHandler.post(() -> {
+                    if (progressDialog.isShowing()) {
+                        progressDialog.dismiss();
+                    }
+                    String msg = "File: " + file.getName()
+                            + "\nSize: " + StorageHelper.formatSize(file.length())
+                            + "\n\nMD5:\n" + md5
+                            + "\n\nSHA-256:\n" + sha256;
+
+                    new AlertDialog.Builder(MainActivity.this)
+                            .setTitle("File Checksums")
+                            .setMessage(msg)
+                            .setPositiveButton("Copy MD5", (d, w) -> {
+                                ClipboardManager cb = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+                                cb.setPrimaryClip(ClipData.newPlainText("MD5", md5));
+                                toast("MD5 copied to clipboard");
+                            })
+                            .setNeutralButton("Copy SHA-256", (d, w) -> {
+                                ClipboardManager cb = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+                                cb.setPrimaryClip(ClipData.newPlainText("SHA-256", sha256));
+                                toast("SHA-256 copied to clipboard");
+                            })
+                            .setNegativeButton("Close", null)
+                            .show();
+                });
+            } catch (Exception e) {
+                mainHandler.post(() -> {
+                    if (progressDialog.isShowing()) progressDialog.dismiss();
+                    toast("Failed to calculate checksum: " + e.getMessage());
+                });
+            }
+        });
+    }
+
+    private static String bytesToHex(byte[] bytes) {
+        StringBuilder sb = new StringBuilder();
+        for (byte b : bytes) {
+            sb.append(String.format("%02x", b));
+        }
+        return sb.toString();
+    }
+
+    private void openWithExternalAppChooser(File file) {
+        String ext = fileExtension(file);
+        String mimeType = "apk".equals(ext)
+                ? "application/vnd.android.package-archive"
+                : MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext);
+        if (mimeType == null) {
+            mimeType = "*/*";
+        }
+        openFileWithMimeType(file, mimeType);
     }
 
     private String formatFileSize(long bytes) {
-        if (bytes < 1024) {
-            return bytes + " B";
-        }
-        if (bytes < 1024L * 1024L) {
-            return String.format(Locale.getDefault(), "%.1f KB", bytes / 1024.0);
-        }
-        return String.format(Locale.getDefault(), "%.1f MB", bytes / (1024.0 * 1024.0));
+        return StorageHelper.formatSize(bytes);
     }
 
     private void showArchiveFormatChooser() {
