@@ -72,6 +72,8 @@ public class VideoPlayerActivity extends AppCompatActivity {
         currentTimeView = findViewById(R.id.videoCurrentTime);
         durationView = findViewById(R.id.videoDuration);
         playPauseButton = findViewById(R.id.videoPlayPause);
+        ImageButton rewindButton = findViewById(R.id.videoRewind);
+        ImageButton forwardButton = findViewById(R.id.videoForward);
         progressBar = findViewById(R.id.videoProgress);
         ((TextView) findViewById(R.id.videoTitle)).setText(fileName);
 
@@ -102,6 +104,8 @@ public class VideoPlayerActivity extends AppCompatActivity {
         });
 
         playPauseButton.setOnClickListener(v -> togglePlayPause());
+        rewindButton.setOnClickListener(v -> seekBy(-10000));
+        forwardButton.setOnClickListener(v -> seekBy(10000));
 
         seekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override
@@ -144,6 +148,17 @@ public class VideoPlayerActivity extends AppCompatActivity {
             startSeekBarUpdate();
         }
         updatePlayPauseIcon();
+    }
+
+    private void seekBy(int offsetMillis) {
+        if (videoView == null || videoView.getDuration() <= 0) {
+            return;
+        }
+        int target = Math.max(0, Math.min(videoView.getDuration(),
+                videoView.getCurrentPosition() + offsetMillis));
+        videoView.seekTo(target);
+        seekBar.setProgress(target);
+        currentTimeView.setText(formatTime(target));
     }
 
     private void updatePlayPauseIcon() {

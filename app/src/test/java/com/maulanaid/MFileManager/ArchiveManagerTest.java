@@ -105,6 +105,51 @@ public class ArchiveManagerTest {
         }
     }
 
+        @Test
+        public void extractsOnlySelectedArchiveFilesAndFolders() throws Exception {
+        File unrelated = new File(sourceDirectory, "unrelated.txt");
+        Files.write(unrelated.toPath(), "unrelated".getBytes(StandardCharsets.UTF_8));
+        List<ArchiveManager.Format> formats = Arrays.asList(
+            ArchiveManager.Format.ZIP,
+            ArchiveManager.Format.SEVEN_ZIP,
+            ArchiveManager.Format.TAR,
+            ArchiveManager.Format.TAR_GZ);
+
+        for (ArchiveManager.Format format : formats) {
+            File archive = new File(workDirectory, "selected" + format.extension());
+            ArchiveManager.create(Arrays.asList(sourceDirectory), archive, format, null);
+
+            File fileDestination = new File(workDirectory, "selected-file-" + format.name());
+            assertTrue(fileDestination.mkdir());
+            assertEquals(1, ArchiveManager.extractEntries(archive,
+                    Arrays.asList("source/nested/sample.txt"), fileDestination, null));
+            assertTrue(new File(fileDestination, "sample.txt").isFile());
+            assertFalse(new File(fileDestination, "unrelated.txt").exists());
+            assertFalse(new File(fileDestination, "nested").exists());
+
+            File folderDestination = new File(workDirectory, "selected-folder-" + format.name());
+            assertTrue(folderDestination.mkdir());
+            assertEquals(1, ArchiveManager.extractEntries(archive,
+                    Arrays.asList("source/nested/"), folderDestination, null));
+            assertTrue(new File(folderDestination, "nested/sample.txt").isFile());
+            assertFalse(new File(folderDestination, "unrelated.txt").exists());
+        }
+    }
+
+    @Test
+    public void extractsSelectedGzipEntry() throws Exception {
+        File archive = new File(workDirectory, "selected.gz");
+        ArchiveManager.create(Arrays.asList(sourceFile), archive,
+                ArchiveManager.Format.GZIP, null);
+        File destination = new File(workDirectory, "selected-gzip");
+        assertTrue(destination.mkdir());
+
+        assertEquals(1, ArchiveManager.extractEntries(archive,
+                Arrays.asList(sourceFile.getName()), destination, null));
+        assertEquals(CONTENT, new String(Files.readAllBytes(
+            new File(destination, sourceFile.getName()).toPath()), StandardCharsets.UTF_8));
+    }
+
     private void deleteRecursively(File file) {
         if (file == null || !file.exists()) {
             return;

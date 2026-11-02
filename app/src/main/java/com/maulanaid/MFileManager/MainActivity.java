@@ -45,12 +45,14 @@ import android.view.SubMenu;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.ArrayAdapter;
+import android.widget.BaseAdapter;
 import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.ImageView;
 import android.widget.ImageButton;
 import android.text.InputType;
 import android.widget.LinearLayout;
+import android.widget.ListView;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -125,6 +127,8 @@ public class MainActivity extends AppCompatActivity {
     private static final String PREF_FTP_PATH = "ftp_share_path";
     private static final String PREF_FTP_URLS = "ftp_share_urls";
     private static final String PREF_FTP_ERROR = "ftp_share_error";
+    private static final String PREF_HTTP_READONLY = HttpShareService.PREF_HTTP_READONLY;
+    private static final String PREF_FTP_READONLY = FtpShareService.PREF_FTP_READONLY;
 
     private RecyclerView fileList;
     private LinearLayoutManager fileLayoutManager;
@@ -144,10 +148,19 @@ public class MainActivity extends AppCompatActivity {
     private File currentDirectory;
     private final Set<File> selectedFiles = new LinkedHashSet<>();
     private final List<File> clipboardFiles = new ArrayList<>();
+    private File archiveClipboardFile;
+    private final List<String> archiveClipboardEntries = new ArrayList<>();
+    private char[] archiveClipboardPassword = new char[0];
+    private File archiveBrowserFile;
+    private ArchiveBrowserNode archiveBrowserRoot;
+    private char[] archiveBrowserPassword = new char[0];
+    private final Set<String> expandedArchivePaths = new LinkedHashSet<>();
+    private int archiveLoadGeneration;
     private final List<File> rowFiles = new ArrayList<>();
     private final List<FileListAdapter.Row> displayRows = new ArrayList<>();
     private File pendingFocusDirectory;
     private File lastRenderedDirectory;
+    private File lastRenderedArchiveFile;
     private String lastRenderedQuery = "";
     private boolean lastRenderedTreeView;
     private boolean hasRenderedOnce;
@@ -239,11 +252,8 @@ public class MainActivity extends AppCompatActivity {
             }
         }
 
-        View drivesButton = findViewById(R.id.drivesButton);
-        if (drivesButton != null) {
-            drivesButton.setOnClickListener(view -> goToStorageDevices());
-        }
         findViewById(R.id.settingsButton).setOnClickListener(this::showSettingsMenu);
+        findViewById(R.id.drivesButton).setOnClickListener(view -> goToStorageDevices());
         findViewById(R.id.goButton).setOnClickListener(view -> goToPath());
         findViewById(R.id.homeButton).setOnClickListener(view -> goHome());
         findViewById(R.id.upButton).setOnClickListener(view -> goUp());
@@ -253,6 +263,11 @@ public class MainActivity extends AppCompatActivity {
         getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
             @Override
             public void handleOnBackPressed() {
+                if (archiveBrowserFile != null) {
+                    leaveArchiveBrowser();
+                    showFiles();
+                    return;
+                }
                 if (treeViewEnabled && !expandedPaths.isEmpty()) {
                     goUp();
                     return;
@@ -345,6 +360,8 @@ public class MainActivity extends AppCompatActivity {
     protected void onDestroy() {
         renderGeneration.incrementAndGet();
         mainHandler.removeCallbacksAndMessages(null);
+        clearArchiveClipboard();
+        leaveArchiveBrowser();
         if (adapter != null) {
             adapter.close();
         }
@@ -372,6 +389,20 @@ public class MainActivity extends AppCompatActivity {
     private void handleFileClick(File clickedFile) {
         if (!selectedFiles.isEmpty()) {
             toggleSelectedFile(clickedFile);
+            return;
+        }
+        if (clickedFile instanceof ArchiveEntryFile) {
+            ArchiveEntryFile entry = (ArchiveEntryFile) clickedFile;
+            if (entry.node.directory) {
+                toggleExpandedArchiveEntry(entry.node);
+            } else {
+                selectedFiles.add(clickedFile);
+                renderFiles();
+            }
+            return;
+        }
+        if (clickedFile.isFile() && ArchiveManager.isSupportedArchive(clickedFile)) {
+            loadArchiveBrowser(clickedFile, new char[0]);
             return;
         }
         if (clickedFile.isDirectory()) {
@@ -507,7 +538,7 @@ public class MainActivity extends AppCompatActivity {
         sortingMenu.setGroupCheckable(Menu.NONE, true, true);
 
         MenuItem pasteItem = popup.getMenu().add("Paste into current folder");
-        pasteItem.setEnabled(!clipboardFiles.isEmpty());
+        pasteItem.setEnabled(!clipboardFiles.isEmpty() || !archiveClipboardEntries.isEmpty());
         pasteItem.setOnMenuItemClickListener(item -> {
             pasteClipboard(currentDirectory);
             return true;
@@ -516,6 +547,32 @@ public class MainActivity extends AppCompatActivity {
         MenuItem credentialsItem = popup.getMenu().add("File share login");
         credentialsItem.setOnMenuItemClickListener(item -> {
             showShareCredentialsDialog(null, false);
+            return true;
+        });
+
+        MenuItem httpReadonlyItem = popup.getMenu().add("HTTP share — read-only");
+        httpReadonlyItem.setCheckable(true)
+                .setChecked(preferences.getBoolean(PREF_HTTP_READONLY, false));
+        httpReadonlyItem.setOnMenuItemClickListener(item -> {
+            boolean nowReadonly = !preferences.getBoolean(PREF_HTTP_READONLY, false);
+            preferences.edit().putBoolean(PREF_HTTP_READONLY, nowReadonly).apply();
+            if (preferences.getBoolean(PREF_HTTP_ACTIVE, false)) {
+                startHttpShareService(preferences.getString(PREF_HTTP_PATH, ""));
+            }
+            toast(nowReadonly ? "HTTP sharing is now read-only" : "HTTP sharing is now read/write");
+            return true;
+        });
+
+        MenuItem ftpReadonlyItem = popup.getMenu().add("FTP share — read-only");
+        ftpReadonlyItem.setCheckable(true)
+                .setChecked(preferences.getBoolean(PREF_FTP_READONLY, false));
+        ftpReadonlyItem.setOnMenuItemClickListener(item -> {
+            boolean nowReadonly = !preferences.getBoolean(PREF_FTP_READONLY, false);
+            preferences.edit().putBoolean(PREF_FTP_READONLY, nowReadonly).apply();
+            if (preferences.getBoolean(PREF_FTP_ACTIVE, false)) {
+                startFtpShareService(preferences.getString(PREF_FTP_PATH, ""));
+            }
+            toast(nowReadonly ? "FTP sharing is now read-only" : "FTP sharing is now full-access");
             return true;
         });
 
@@ -600,6 +657,25 @@ public class MainActivity extends AppCompatActivity {
 
     private void showContextMenu(File pressedFile) {
         List<ActionItem> actions = new ArrayList<>();
+        if (pressedFile instanceof ArchiveEntryFile) {
+            actions.add(new ActionItem("Copy selected archive item(s)", R.drawable.ic_action_copy,
+                    this::copySelected));
+            actions.add(new ActionItem("Select all visible archive items", R.drawable.ic_action_check,
+                    () -> {
+                        for (File file : rowFiles) {
+                            if (file instanceof ArchiveEntryFile) {
+                                selectedFiles.add(file);
+                            }
+                        }
+                        renderFiles();
+                    }));
+            actions.add(new ActionItem("Clear selection", R.drawable.ic_action_check, () -> {
+                selectedFiles.clear();
+                renderFiles();
+            }));
+            showActionDialog(actions, selectedFiles.size() + " selected");
+            return;
+        }
         if (selectedFiles.size() == 1 && pressedFile.isDirectory()) {
             actions.add(new ActionItem("Browse into this folder", R.drawable.ic_action_open, () -> {
                 currentDirectory = pressedFile;
@@ -637,7 +713,7 @@ public class MainActivity extends AppCompatActivity {
         }
         if (selectedFiles.size() == 1 && ArchiveManager.isSupportedArchive(pressedFile)) {
             actions.add(new ActionItem("Browse archive", R.drawable.ic_file_archive,
-                    () -> showArchivePasswordDialog(pressedFile, false)));
+                    () -> loadArchiveBrowser(pressedFile, new char[0])));
             actions.add(new ActionItem("Extract archive...", R.drawable.ic_file_archive,
                     () -> showArchivePasswordDialog(pressedFile, true)));
         }
@@ -648,12 +724,16 @@ public class MainActivity extends AppCompatActivity {
         actions.add(new ActionItem("Share this file/folder over HTTP",
                 R.drawable.ic_action_share, () -> requestHttpShare(pressedFile)));
         if (pressedFile.isDirectory()) {
-            actions.add(new ActionItem("Share folder over FTP (read-only)",
+            boolean ftpReadonly = preferences.getBoolean(PREF_FTP_READONLY, false);
+            String ftpLabel = ftpReadonly
+                    ? "Share folder over FTP (read-only)"
+                    : "Share folder over FTP (full access)";
+            actions.add(new ActionItem(ftpLabel,
                     R.drawable.ic_action_share, () -> requestFtpShare(pressedFile)));
         }
         actions.add(new ActionItem("Copy " + selectedFiles.size() + " item(s)",
                 R.drawable.ic_action_copy, this::copySelected));
-        if (!clipboardFiles.isEmpty()) {
+        if (!clipboardFiles.isEmpty() || !archiveClipboardEntries.isEmpty()) {
             File destination = pressedFile.isDirectory() ? pressedFile : currentDirectory;
             actions.add(new ActionItem("Paste here", R.drawable.ic_action_paste,
                     () -> pasteClipboard(destination)));
@@ -674,6 +754,10 @@ public class MainActivity extends AppCompatActivity {
             renderFiles();
         }));
 
+        showActionDialog(actions, selectedFiles.size() + " selected");
+    }
+
+    private void showActionDialog(List<ActionItem> actions, String title) {
         ArrayAdapter<ActionItem> actionAdapter = new ArrayAdapter<ActionItem>(this, 0, actions) {
             @Override
             public View getView(int position, View convertView, ViewGroup parent) {
@@ -688,7 +772,7 @@ public class MainActivity extends AppCompatActivity {
             }
         };
         new AlertDialog.Builder(this)
-                .setTitle(selectedFiles.size() + " selected")
+            .setTitle(title)
                 .setAdapter(actionAdapter, (dialog, position) -> actions.get(position).action.run())
                 .show();
     }
@@ -702,7 +786,8 @@ public class MainActivity extends AppCompatActivity {
 
     private void showFiles() {
         pendingFocusDirectory = null;
-        String path = currentDirectory.getAbsolutePath();
+        String path = archiveBrowserFile == null ? currentDirectory.getAbsolutePath()
+            : archiveBrowserFile.getAbsolutePath() + "!/";
         if (!path.equals(pathInput.getText().toString())) {
             pathInput.setText(path);
         }
@@ -712,6 +797,10 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void toggleExpandedFolder(File folder) {
+        if (folder instanceof ArchiveEntryFile) {
+            toggleExpandedArchiveEntry(((ArchiveEntryFile) folder).node);
+            return;
+        }
         String path = folder.getAbsolutePath();
         if (expandedPaths.contains(path)) {
             expandedPaths.remove(path);
@@ -761,17 +850,21 @@ public class MainActivity extends AppCompatActivity {
         final int gen = renderGeneration.incrementAndGet();
         final boolean treeView = treeViewEnabled;
         final File dir = currentDirectory;
+        final File archiveFile = archiveBrowserFile;
+        final ArchiveBrowserNode archiveRoot = archiveBrowserRoot;
         final String query = searchQuery;
         final String grp = grouping;
         final boolean showHidden = showHiddenFiles;
         final Set<String> expanded = new LinkedHashSet<>(expandedPaths);
         final Set<File> selected = new LinkedHashSet<>(selectedFiles);
+        final Set<String> archiveExpanded = new LinkedHashSet<>(expandedArchivePaths);
         final Comparator<File> cmp = fileComparator();
         final SimpleDateFormat dateFmt = new SimpleDateFormat("MMM d", Locale.getDefault());
 
         // A different folder, query, or view mode should not make the whole list flash.
         final boolean resetScroll = !hasRenderedOnce
                 || !dir.equals(lastRenderedDirectory)
+            || !sameFile(archiveFile, lastRenderedArchiveFile)
                 || !query.equals(lastRenderedQuery)
                 || treeView != lastRenderedTreeView;
         final boolean animateChanges = hasRenderedOnce && !resetScroll;
@@ -787,7 +880,10 @@ public class MainActivity extends AppCompatActivity {
             List<FileListAdapter.Row> rows = new ArrayList<>();
             List<File> rowFilesList = new ArrayList<>();
 
-            if (StorageHelper.isStorageRoot(dir)) {
+            if (archiveFile != null && archiveRoot != null) {
+                buildArchiveRows(archiveFile, archiveRoot, 0, query, archiveExpanded,
+                        selected, rows, rowFilesList);
+            } else if (StorageHelper.isStorageRoot(dir)) {
                 List<StorageHelper.StorageDevice> devices = StorageHelper.getStorageDevices(MainActivity.this);
                 for (StorageHelper.StorageDevice dev : devices) {
                     if (!query.isEmpty()
@@ -876,6 +972,7 @@ public class MainActivity extends AppCompatActivity {
                     }
                     hasRenderedOnce = true;
                     lastRenderedDirectory = dir;
+                    lastRenderedArchiveFile = archiveFile;
                     lastRenderedQuery = query;
                     lastRenderedTreeView = treeView;
                     restoreScrollAfterRender(resetScroll);
@@ -957,6 +1054,52 @@ public class MainActivity extends AppCompatActivity {
                         cmp, rows, rowFiles, dirCache, dateFmt, showHidden);
             }
         }
+    }
+
+    private void buildArchiveRows(File archive, ArchiveBrowserNode parent, int depth,
+            String query, Set<String> expanded, Set<File> selected,
+            List<FileListAdapter.Row> rows, List<File> files) {
+        for (ArchiveBrowserNode node : parent.children.values()) {
+            if (!query.isEmpty() && !node.name.toLowerCase(Locale.ROOT).contains(query)) {
+                continue;
+            }
+            ArchiveEntryFile file = new ArchiveEntryFile(archive, node);
+            boolean isExpanded = node.directory && expanded.contains(node.path);
+            String details = node.directory
+                    ? node.children.size() + (node.children.size() == 1 ? " item" : " items")
+                    : node.size < 0 ? "File" : formatFileSize(node.size);
+                rows.add(FileListAdapter.Row.archiveNode(file, details, selected.contains(file), depth,
+                    node.directory, isExpanded, !node.children.isEmpty()));
+            files.add(file);
+            if (isExpanded) {
+                buildArchiveRows(archive, node, depth + 1, query, expanded, selected, rows, files);
+            }
+        }
+    }
+
+    private void toggleExpandedArchiveEntry(ArchiveBrowserNode node) {
+        if (expandedArchivePaths.remove(node.path)) {
+            node.expanded = false;
+        } else {
+            expandedArchivePaths.add(node.path);
+            node.expanded = true;
+        }
+        renderFiles();
+    }
+
+    private void leaveArchiveBrowser() {
+        archiveLoadGeneration++;
+        selectedFiles.removeIf(file -> file instanceof ArchiveEntryFile);
+        archiveBrowserFile = null;
+        archiveBrowserRoot = null;
+        expandedArchivePaths.clear();
+        Arrays.fill(archiveBrowserPassword, '\0');
+        archiveBrowserPassword = new char[0];
+        updateSelection();
+    }
+
+    private boolean sameFile(File first, File second) {
+        return first == null ? second == null : first.equals(second);
     }
 
     private void buildFlatRows(String groupName, List<File> files, Set<File> selected,
@@ -1086,6 +1229,7 @@ public class MainActivity extends AppCompatActivity {
             toast("Folder not found or cannot be read");
             return;
         }
+        leaveArchiveBrowser();
         currentDirectory = requested;
         selectedFiles.clear();
         pendingFocusDirectory = null;
@@ -1095,6 +1239,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void goToStorageDevices() {
+        leaveArchiveBrowser();
         currentDirectory = new File(StorageHelper.STORAGE_ROOT_PATH);
         selectedFiles.clear();
         pendingFocusDirectory = null;
@@ -1104,6 +1249,12 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void goUp() {
+        if (archiveBrowserFile != null) {
+            leaveArchiveBrowser();
+            showFiles();
+            scrollToTop();
+            return;
+        }
         if (treeViewEnabled) {
             File targetToCollapse = null;
             if (lastClickedDirectory != null && expandedPaths.contains(lastClickedDirectory.getAbsolutePath())) {
@@ -1151,6 +1302,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void goHome() {
+        leaveArchiveBrowser();
         currentDirectory = homeDirectory;
         selectedFiles.clear();
         pendingFocusDirectory = null;
@@ -1643,18 +1795,290 @@ public class MainActivity extends AppCompatActivity {
                             }
                         }, true);
                     } else {
-                        runArchiveOperation("Reading " + archive.getName(), () -> {
-                            try {
-                                List<ArchiveManager.EntryInfo> entries = ArchiveManager
-                                        .listEntries(archive, password.length == 0 ? null : password);
-                                return describeArchive(archive, entries);
-                            } finally {
-                                Arrays.fill(password, '\0');
-                            }
-                        }, false);
+                        loadArchiveBrowser(archive, password);
                     }
                 }));
         dialog.show();
+    }
+
+    private void loadArchiveBrowser(File archive, char[] password) {
+        leaveArchiveBrowser();
+        int loadGeneration = ++archiveLoadGeneration;
+        toast("Reading " + archive.getName());
+
+        archiveExecutor.execute(() -> {
+            ArchiveBrowserNode root = new ArchiveBrowserNode("", "", true, -1, -1);
+            Exception failure = null;
+            try {
+                List<ArchiveManager.EntryInfo> entries = ArchiveManager.listEntries(archive,
+                        password.length == 0 ? null : password);
+                for (ArchiveManager.EntryInfo entry : entries) {
+                    addArchiveBrowserEntry(root, entry);
+                }
+            } catch (Exception exception) {
+                failure = exception;
+            }
+            Exception loadFailure = failure;
+            mainHandler.post(() -> {
+                if (isFinishing() || isDestroyed() || loadGeneration != archiveLoadGeneration) {
+                    Arrays.fill(password, '\0');
+                    return;
+                }
+                if (loadFailure != null) {
+                    boolean needsPassword = password.length == 0;
+                    Arrays.fill(password, '\0');
+                    if (needsPassword) {
+                        showArchivePasswordDialog(archive, false);
+                    } else {
+                        String message = loadFailure.getMessage();
+                        toast(message == null ? "The archive could not be read." : message);
+                    }
+                    return;
+                }
+                archiveBrowserFile = archive;
+                archiveBrowserRoot = root;
+                archiveBrowserPassword = password.clone();
+                Arrays.fill(password, '\0');
+                selectedFiles.clear();
+                expandedArchivePaths.clear();
+                searchInput.setText("");
+                pathInput.setText(archive.getAbsolutePath() + "!/");
+                renderFiles();
+            });
+        });
+    }
+
+    private void showArchiveBrowserDialog(File archive,
+            List<ArchiveManager.EntryInfo> entries, char[] password) {
+        ArchiveBrowserNode root = new ArchiveBrowserNode("", "", true, -1, -1);
+        for (ArchiveManager.EntryInfo entry : entries) {
+            addArchiveBrowserEntry(root, entry);
+        }
+
+        List<ArchiveBrowserNode> visible = new ArrayList<>();
+        flattenArchiveBrowser(root, visible);
+        final android.widget.Button[] copyButton = { null };
+        final Runnable updateCopyButton = () -> {
+            android.widget.Button button = copyButton[0];
+            if (button != null) {
+                List<ArchiveBrowserNode> selected = new ArrayList<>();
+                collectSelectedArchiveNodes(root, selected);
+                button.setText("Copy selected (" + selected.size() + ")");
+                button.setEnabled(!selected.isEmpty());
+            }
+        };
+        BaseAdapter rows = new BaseAdapter() {
+            @Override
+            public int getCount() {
+                return visible.size();
+            }
+
+            @Override
+            public ArchiveBrowserNode getItem(int position) {
+                return visible.get(position);
+            }
+
+            @Override
+            public long getItemId(int position) {
+                return getItem(position).path.hashCode();
+            }
+
+            @Override
+            public View getView(int position, View convertView, ViewGroup parent) {
+                LinearLayout row;
+                TextView labelView;
+                CheckBox checkBox;
+                if (convertView instanceof LinearLayout) {
+                    row = (LinearLayout) convertView;
+                    labelView = (TextView) row.getChildAt(0);
+                    checkBox = (CheckBox) row.getChildAt(1);
+                } else {
+                    row = new LinearLayout(MainActivity.this);
+                    row.setGravity(android.view.Gravity.CENTER_VERTICAL);
+                    int rowPadding = Math.round(4 * getResources().getDisplayMetrics().density);
+                    row.setPadding(rowPadding, 0, rowPadding, 0);
+                    labelView = new TextView(MainActivity.this);
+                    labelView.setTextSize(13);
+                    labelView.setSingleLine(true);
+                    labelView.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
+                    checkBox = new CheckBox(MainActivity.this);
+                    row.addView(labelView, new LinearLayout.LayoutParams(
+                            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+                    row.addView(checkBox, new LinearLayout.LayoutParams(
+                            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+                }
+                ArchiveBrowserNode node = getItem(position);
+                StringBuilder label = new StringBuilder();
+                for (int depth = 0; depth < node.depth; depth++) {
+                    label.append("   ");
+                }
+                if (node.directory) {
+                    label.append(node.expanded ? "[-] " : "[+] ");
+                } else {
+                    label.append("    ");
+                }
+                label.append(node.name);
+                if (!node.directory && node.size >= 0) {
+                    label.append("  ").append(formatFileSize(node.size));
+                }
+                labelView.setText(label.toString());
+                row.setMinimumHeight(Math.round(34 * getResources().getDisplayMetrics().density));
+                checkBox.setOnCheckedChangeListener(null);
+                checkBox.setChecked(node.selected);
+                checkBox.setOnCheckedChangeListener((button, checked) -> {
+                    node.selected = checked;
+                    updateCopyButton.run();
+                });
+                return row;
+            }
+        };
+
+        ListView listView = new ListView(this);
+        listView.setAdapter(rows);
+        listView.setOnItemClickListener((parent, view, position, id) -> {
+            ArchiveBrowserNode node = visible.get(position);
+            if (node.directory) {
+                node.expanded = !node.expanded;
+                visible.clear();
+                flattenArchiveBrowser(root, visible);
+                rows.notifyDataSetChanged();
+            } else {
+                node.selected = !node.selected;
+                rows.notifyDataSetChanged();
+                updateCopyButton.run();
+            }
+        });
+        listView.setOnItemLongClickListener((parent, view, position, id) -> {
+            ArchiveBrowserNode node = visible.get(position);
+            node.selected = !node.selected;
+            rows.notifyDataSetChanged();
+            updateCopyButton.run();
+            return true;
+        });
+
+        LinearLayout content = new LinearLayout(this);
+        content.setOrientation(LinearLayout.VERTICAL);
+        int padding = Math.round(12 * getResources().getDisplayMetrics().density);
+        content.setPadding(padding, 0, padding, 0);
+        content.addView(listView, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                Math.round(400 * getResources().getDisplayMetrics().density)));
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle(archive.getName())
+                .setView(content)
+                .setNegativeButton("Close", null)
+                .setPositiveButton("Copy selected", null)
+                .create();
+        final boolean[] copied = { false };
+        dialog.setOnShowListener(ignored -> {
+            android.widget.Button button = dialog.getButton(AlertDialog.BUTTON_POSITIVE);
+            copyButton[0] = button;
+            button.setOnClickListener(view -> {
+                List<ArchiveBrowserNode> selected = new ArrayList<>();
+                collectSelectedArchiveNodes(root, selected);
+                List<String> paths = normalizedArchiveSelections(selected);
+                if (paths.isEmpty()) {
+                    return;
+                }
+                clearArchiveClipboard();
+                clipboardFiles.clear();
+                archiveClipboardFile = archive;
+                archiveClipboardEntries.addAll(paths);
+                archiveClipboardPassword = password.clone();
+                Arrays.fill(password, '\0');
+                copied[0] = true;
+                selectedFiles.clear();
+                updateSelection();
+                toast("Copied " + paths.size() + " archive item(s)");
+                dialog.dismiss();
+            });
+            updateCopyButton.run();
+        });
+        dialog.setOnDismissListener(ignored -> {
+            if (!copied[0]) {
+                Arrays.fill(password, '\0');
+            }
+        });
+        dialog.show();
+    }
+
+    private void addArchiveBrowserEntry(ArchiveBrowserNode root,
+            ArchiveManager.EntryInfo entry) {
+        String normalized = entry.name.replace('\\', '/');
+        while (normalized.startsWith("/")) {
+            normalized = normalized.substring(1);
+        }
+        String[] parts = normalized.split("/");
+        ArchiveBrowserNode parent = root;
+        StringBuilder path = new StringBuilder();
+        for (int index = 0; index < parts.length; index++) {
+            String part = parts[index];
+            if (part.isEmpty()) {
+                continue;
+            }
+            if (".".equals(part) || "..".equals(part)) {
+                return;
+            }
+            if (path.length() > 0) {
+                path.append('/');
+            }
+            path.append(part);
+            boolean directory = index < parts.length - 1 || entry.directory;
+            ArchiveBrowserNode child = parent.children.get(part);
+            if (child == null) {
+                child = new ArchiveBrowserNode(part, path.toString(), directory,
+                        parent.depth + 1, directory ? -1 : entry.unpackedSize);
+                child.parent = parent;
+                parent.children.put(part, child);
+            } else if (directory) {
+                child.directory = true;
+            } else {
+                child.size = entry.unpackedSize;
+            }
+            parent = child;
+        }
+    }
+
+    private void flattenArchiveBrowser(ArchiveBrowserNode parent,
+            List<ArchiveBrowserNode> visible) {
+        for (ArchiveBrowserNode child : parent.children.values()) {
+            visible.add(child);
+            if (child.directory && child.expanded) {
+                flattenArchiveBrowser(child, visible);
+            }
+        }
+    }
+
+    private void collectSelectedArchiveNodes(ArchiveBrowserNode parent,
+            List<ArchiveBrowserNode> selected) {
+        for (ArchiveBrowserNode child : parent.children.values()) {
+            if (child.selected) {
+                selected.add(child);
+            }
+            collectSelectedArchiveNodes(child, selected);
+        }
+    }
+
+    private List<String> normalizedArchiveSelections(List<ArchiveBrowserNode> selected) {
+        selected.sort(Comparator.comparingInt(node -> node.path.length()));
+        List<ArchiveBrowserNode> accepted = new ArrayList<>();
+        List<String> paths = new ArrayList<>();
+        for (ArchiveBrowserNode candidate : selected) {
+            boolean nested = false;
+            for (ArchiveBrowserNode parent : accepted) {
+                if (parent.directory && (candidate.path.equals(parent.path)
+                        || candidate.path.startsWith(parent.path + "/"))) {
+                    nested = true;
+                    break;
+                }
+            }
+            if (!nested) {
+                accepted.add(candidate);
+                paths.add(candidate.path + (candidate.directory ? "/" : ""));
+            }
+        }
+        return paths;
     }
 
     private String describeArchive(File archive, List<ArchiveManager.EntryInfo> entries) {
@@ -1741,16 +2165,66 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void copySelected() {
+        if (!selectedFiles.isEmpty() && selectedFiles.iterator().next() instanceof ArchiveEntryFile) {
+            copySelectedArchiveEntries();
+            return;
+        }
         List<File> sources = getNormalizedSelection();
         if (sources.isEmpty()) {
             toast("Select a file or folder first");
             return;
         }
+        clearArchiveClipboard();
         clipboardFiles.clear();
         clipboardFiles.addAll(sources);
         selectedFiles.clear();
         renderFiles();
         toast("Copied " + clipboardFiles.size() + " item(s)");
+    }
+
+    private void copySelectedArchiveEntries() {
+        List<ArchiveEntryFile> candidates = new ArrayList<>();
+        for (File file : selectedFiles) {
+            if (file instanceof ArchiveEntryFile) {
+                candidates.add((ArchiveEntryFile) file);
+            }
+        }
+        candidates.sort(Comparator.comparingInt(entry -> entry.node.path.length()));
+        List<ArchiveEntryFile> accepted = new ArrayList<>();
+        List<String> paths = new ArrayList<>();
+        for (ArchiveEntryFile candidate : candidates) {
+            boolean nested = false;
+            for (ArchiveEntryFile parent : accepted) {
+                if (parent.node.directory && candidate.node.path.startsWith(parent.node.path + "/")) {
+                    nested = true;
+                    break;
+                }
+            }
+            if (!nested) {
+                accepted.add(candidate);
+                paths.add(candidate.node.path + (candidate.node.directory ? "/" : ""));
+            }
+        }
+        if (paths.isEmpty() || archiveBrowserFile == null) {
+            toast("Select archive items first");
+            return;
+        }
+        clearArchiveClipboard();
+        clipboardFiles.clear();
+        archiveClipboardFile = archiveBrowserFile;
+        archiveClipboardEntries.addAll(paths);
+        archiveClipboardPassword = archiveBrowserPassword.clone();
+        selectedFiles.clear();
+        updateSelection();
+        renderFiles();
+        toast("Copied " + paths.size() + " archive item(s)");
+    }
+
+    private void clearArchiveClipboard() {
+        archiveClipboardFile = null;
+        archiveClipboardEntries.clear();
+        Arrays.fill(archiveClipboardPassword, '\0');
+        archiveClipboardPassword = new char[0];
     }
 
     private List<File> getNormalizedSelection() {
@@ -1781,6 +2255,10 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void pasteClipboard(File targetDirectory) {
+        if (!archiveClipboardEntries.isEmpty()) {
+            pasteArchiveClipboard(targetDirectory);
+            return;
+        }
         if (clipboardFiles.isEmpty()) {
             toast("Clipboard is empty");
             return;
@@ -1791,6 +2269,55 @@ public class MainActivity extends AppCompatActivity {
         }
         List<File> sources = new ArrayList<>(clipboardFiles);
         processPasteItem(sources, 0, targetDirectory, CONFLICT_ASK, new PasteProgress());
+    }
+
+    private void pasteArchiveClipboard(File targetDirectory) {
+        if (!targetDirectory.isDirectory() || !targetDirectory.canWrite()) {
+            toast("Destination folder cannot be written");
+            return;
+        }
+        if (archiveClipboardFile == null || !archiveClipboardFile.isFile()
+                || !archiveClipboardFile.canRead()) {
+            toast("The source archive is no longer available");
+            return;
+        }
+        File archive = archiveClipboardFile;
+        List<String> entries = new ArrayList<>(archiveClipboardEntries);
+        char[] password = archiveClipboardPassword.clone();
+        runArchiveOperation("Extracting selected archive items", () -> {
+            int copied = 0;
+            int skipped = 0;
+            int failed = 0;
+            try {
+                for (String entry : entries) {
+                    String path = entry.endsWith("/")
+                            ? entry.substring(0, entry.length() - 1) : entry;
+                    int separator = path.lastIndexOf('/');
+                    String outputName = path.substring(separator + 1);
+                    if (new File(targetDirectory, outputName).exists()) {
+                        skipped++;
+                        continue;
+                    }
+                    try {
+                        int extracted = ArchiveManager.extractEntries(archive,
+                                Collections.singletonList(entry), targetDirectory,
+                                password.length == 0 ? null : password);
+                        if (extracted > 0 || entry.endsWith("/")) {
+                            copied++;
+                        } else {
+                            failed++;
+                        }
+                    } catch (Exception exception) {
+                        deleteRecursively(new File(targetDirectory, outputName));
+                        failed++;
+                    }
+                }
+                return "Paste complete. " + copied + " copied, " + skipped
+                        + " skipped, " + failed + " failed";
+            } finally {
+                Arrays.fill(password, '\0');
+            }
+        }, true);
     }
 
     private void processPasteItem(List<File> sources, int index, File targetDirectory,
@@ -2172,7 +2699,7 @@ public class MainActivity extends AppCompatActivity {
         if (selView == null) {
             return;
         }
-        if (count == 0 && clipboardFiles.isEmpty()) {
+        if (count == 0 && clipboardFiles.isEmpty() && archiveClipboardEntries.isEmpty()) {
             selView.setVisibility(View.GONE);
             selView.setText("");
         } else {
@@ -2180,6 +2707,8 @@ public class MainActivity extends AppCompatActivity {
             String text = count == 0 ? "Nothing selected" : count + " item(s) selected";
             if (!clipboardFiles.isEmpty()) {
                 text += " | Clipboard: " + clipboardFiles.size() + " item(s)";
+            } else if (!archiveClipboardEntries.isEmpty()) {
+                text += " | Archive clipboard: " + archiveClipboardEntries.size() + " item(s)";
             }
             selView.setText(text);
         }
@@ -2189,6 +2718,93 @@ public class MainActivity extends AppCompatActivity {
         int copied;
         int skipped;
         int failed;
+    }
+
+    private static final class ArchiveBrowserNode {
+        final String name;
+        final String path;
+        final int depth;
+        final Map<String, ArchiveBrowserNode> children =
+                new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+        ArchiveBrowserNode parent;
+        boolean directory;
+        boolean expanded;
+        boolean selected;
+        long size;
+
+        ArchiveBrowserNode(String name, String path, boolean directory, int depth, long size) {
+            this.name = name;
+            this.path = path;
+            this.directory = directory;
+            this.depth = depth;
+            this.size = size;
+        }
+    }
+
+    private static final class ArchiveEntryFile extends File {
+        private final File archive;
+        private final ArchiveBrowserNode node;
+
+        ArchiveEntryFile(File archive, ArchiveBrowserNode node) {
+            super(archive.getAbsolutePath() + "!/" + node.path);
+            this.archive = archive;
+            this.node = node;
+        }
+
+        @Override
+        public String getName() {
+            return node.name;
+        }
+
+        @Override
+        public String getAbsolutePath() {
+            return archive.getAbsolutePath() + "!/" + node.path;
+        }
+
+        @Override
+        public String getCanonicalPath() {
+            return getAbsolutePath();
+        }
+
+        @Override
+        public File getParentFile() {
+            return node.parent == null ? archive : new ArchiveEntryFile(archive, node.parent);
+        }
+
+        @Override
+        public boolean exists() {
+            return true;
+        }
+
+        @Override
+        public boolean isDirectory() {
+            return node.directory;
+        }
+
+        @Override
+        public boolean isFile() {
+            return !node.directory;
+        }
+
+        @Override
+        public boolean canRead() {
+            return archive.canRead();
+        }
+
+        @Override
+        public boolean canWrite() {
+            return false;
+        }
+
+        @Override
+        public long length() {
+            return Math.max(0, node.size);
+        }
+
+        @Override
+        public long lastModified() {
+            return archive.lastModified();
+        }
     }
 
     private static class ActionItem {
@@ -2426,16 +3042,20 @@ public class MainActivity extends AppCompatActivity {
         if (httpActive) {
             String path = preferences.getString(PREF_HTTP_PATH, "Shared item");
             String urls = preferences.getString(PREF_HTTP_URLS, "http://<device-ip>:8080");
-            status.append("HTTP: ").append(new File(path).getName())
+            boolean httpReadonly = preferences.getBoolean(PREF_HTTP_READONLY, false);
+            status.append("HTTP (").append(httpReadonly ? "read-only" : "read/write").append("): ")
+                    .append(new File(path).getName())
                     .append(" | Port 8080\n").append(urls);
         }
         if (ftpActive) {
             String path = preferences.getString(PREF_FTP_PATH, "Shared folder");
             String urls = preferences.getString(PREF_FTP_URLS, "ftp://<device-ip>:2121");
+            boolean ftpReadonly = preferences.getBoolean(PREF_FTP_READONLY, false);
             if (status.length() > 0) {
                 status.append('\n');
             }
-            status.append("FTP (read-only): ").append(new File(path).getName())
+            status.append("FTP (").append(ftpReadonly ? "read-only" : "full access").append("): ")
+                    .append(new File(path).getName())
                     .append(" | Port 2121\n").append(urls)
                     .append("\nPassive ports 21210-21219");
         }

@@ -73,6 +73,7 @@ public final class HttpShareService extends Service {
     public static final String EXTRA_SHARED_PATH = "shared_path";
     public static final int PORT = 8080;
 
+    public static final String PREF_HTTP_READONLY = "http_share_readonly";
     private static final String PREFS_NAME = "file_manager_preferences";
     private static final String PREF_HTTP_PASSWORD = "http_share_password";
     private static final String PREF_HTTP_USERNAME = "http_share_username";
@@ -84,7 +85,7 @@ public final class HttpShareService extends Service {
     private static final String PREF_DARK_THEME = "dark_theme";
     private static final String CHANNEL_ID = "http_file_share";
     private static final int NOTIFICATION_ID = 8080;
-    private static final int SOCKET_READ_TIMEOUT = 10_000;
+    private static final int SOCKET_READ_TIMEOUT = 120_000;
 
     private SharedFileServer server;
     private File sharedRoot;
@@ -123,7 +124,8 @@ public final class HttpShareService extends Service {
             if (!isValidUsername(username) || password.length() < 8) {
                 throw new IOException("Set valid share credentials first");
             }
-            server = new SharedFileServer(sharedRoot, username, password);
+            boolean readonly = preferences.getBoolean(PREF_HTTP_READONLY, false);
+            server = new SharedFileServer(sharedRoot, username, password, readonly);
             server.start(SOCKET_READ_TIMEOUT, false);
 
             String urls = getLocalUrls();
@@ -132,7 +134,8 @@ public final class HttpShareService extends Service {
                     .putString(PREF_HTTP_PATH, sharedRoot.getAbsolutePath())
                     .putString(PREF_HTTP_URLS, urls)
                     .apply();
-            startForegroundCompat(buildNotification("Sharing " + sharedRoot.getName()
+            String modePrefix = readonly ? "Read-only share: " : "Sharing ";
+            startForegroundCompat(buildNotification(modePrefix + sharedRoot.getName()
                     + " on port " + PORT));
             notifyStatusChanged();
         } catch (IOException | RuntimeException exception) {
@@ -278,12 +281,14 @@ public final class HttpShareService extends Service {
         private final String expectedAuthorization;
         private final String canonicalRoot;
         private final boolean rootIsDirectory;
+        private final boolean readonly;
 
-        SharedFileServer(File root, String username, String password) throws IOException {
+        SharedFileServer(File root, String username, String password, boolean readonly) throws IOException {
             super(PORT);
             this.root = root;
             this.canonicalRoot = root.getCanonicalPath();
             this.rootIsDirectory = root.isDirectory();
+            this.readonly = readonly;
             String credentials = username + ":" + password;
             this.expectedAuthorization = "Basic " + Base64.encodeToString(
                     credentials.getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP);
@@ -300,9 +305,15 @@ public final class HttpShareService extends Service {
             try {
                 String uri = session.getUri();
                 if (Method.PUT.equals(session.getMethod()) && "/upload".equals(uri)) {
+                    if (readonly) {
+                        return text(Response.Status.FORBIDDEN, "Share is currently read-only");
+                    }
                     return upload(session);
                 }
                 if (Method.DELETE.equals(session.getMethod()) && "/delete".equals(uri)) {
+                    if (readonly) {
+                        return text(Response.Status.FORBIDDEN, "Share is currently read-only");
+                    }
                     return deleteSelected(session);
                 }
                 if (Method.GET.equals(session.getMethod()) && "/theme".equals(uri)) {
@@ -390,7 +401,11 @@ public final class HttpShareService extends Service {
                     .append("a{color:var(--accent);text-decoration:none}input[type=checkbox]{width:20px;height:20px}")
                     .append("@media(max-width:500px){main{padding:14px 10px}.row{gap:8px;padding:11px 8px}.toolbar{flex-wrap:wrap}}")
                     .append("</style><body data-directory=\"").append(escapeHtml(relative))
-                    .append("\"><header><h1>MFIle Manager HTTP share</h1><div class=\"path\">")
+                    .append("\"><header><h1>MFIle Manager HTTP share");
+            if (readonly) {
+                page.append(" <span style=\"font-size:12px;background:#e65100;color:#fff;padding:2px 8px;border-radius:10px;vertical-align:middle;font-weight:600;\">Read-only</span>");
+            }
+            page.append("</h1><div class=\"path\">")
                     .append(escapeHtml(root.getAbsolutePath()))
                     .append(relative.isEmpty() ? "" : " / " + escapeHtml(relative))
                     .append("</div></header><main>");
@@ -401,7 +416,7 @@ public final class HttpShareService extends Service {
                         .append(urlEncode(parent)).append("\">&#8592; Parent folder</a>");
             }
             page.append("<div class=\"toolbar\"><button id=\"download\">Download selected as ZIP</button>");
-            if (rootIsDirectory) {
+            if (rootIsDirectory && !readonly) {
                 page.append("<button id=\"delete\">Delete selected</button>")
                         .append("<label class=\"upload\">Upload files<input id=\"files\" type=\"file\" multiple></label>");
             }
@@ -438,7 +453,7 @@ public final class HttpShareService extends Service {
                 page.append("<div class=\"row\"><span class=\"meta\">This folder is empty.</span></div>");
             }
             page.append("</div>");
-            if (rootIsDirectory) {
+            if (rootIsDirectory && !readonly) {
                 page.append("<dialog id=\"upload-conflict\"><h2>File already exists</h2>")
                         .append("<p id=\"conflict-name\"></p><div class=\"conflict-actions\">")
                         .append("<button data-choice=\"replace\">Replace</button>")
@@ -456,7 +471,7 @@ public final class HttpShareService extends Service {
                     .append("location.href='/download.zip?'+p.toString();};");
             page.append("const currentTheme=document.documentElement.classList.contains('dark')?'dark':'light';")
                     .append("setInterval(async()=>{try{const r=await fetch('/theme',{cache:'no-store'});if(r.ok&&(await r.text())!==currentTheme)location.reload();}catch(error){}},3000);");
-            if (rootIsDirectory) {
+            if (rootIsDirectory && !readonly) {
                 page.append("const conflictDialog=document.getElementById('upload-conflict');let resolveConflict=null;")
                         .append("conflictDialog.addEventListener('click',e=>{const button=e.target.closest('[data-choice]');if(button&&resolveConflict){const resolve=resolveConflict;resolveConflict=null;conflictDialog.close();resolve(button.dataset.choice);}});")
                         .append("conflictDialog.addEventListener('cancel',e=>{e.preventDefault();if(resolveConflict){const resolve=resolveConflict;resolveConflict=null;resolve('cancel');}conflictDialog.close();});")
@@ -469,15 +484,17 @@ public final class HttpShareService extends Service {
                         .append("statusBox.textContent='Deleting selected items...';try{const r=await fetch('/delete?'+p.toString(),{method:'DELETE'});")
                         .append("statusBox.textContent=await r.text();if(r.ok)setTimeout(()=>location.reload(),700);")
                         .append("}catch(error){statusBox.textContent='Delete request failed.';}};");
-                page.append("document.getElementById('files').onchange=async e=>{const files=[...e.target.files];")
+                page.append("function xhrUpload(url,file,onPct){return new Promise((res,rej)=>{const x=new XMLHttpRequest();x.open('PUT',url);x.upload.onprogress=e=>{if(e.lengthComputable&&onPct)onPct(Math.round(e.loaded/e.total*100));};x.onload=()=>res({status:x.status,ok:x.status>=200&&x.status<300,text:x.responseText});x.onerror=()=>rej(new Error('Network error'));x.send(file);});}")
+                        .append("document.getElementById('files').onchange=async e=>{const files=[...e.target.files];if(!files.length)return;")
                         .append("let uploaded=0,skipped=0,failed=0,cancelled=false,replaceAll=false,skipAll=false;")
-                        .append("for(let i=0;i<files.length;i++){const f=files[i];statusBox.textContent=`Uploading ${i+1}/${files.length}: ${f.name}`;")
-                        .append("try{let u='/upload?directory='+encodeURIComponent(document.body.dataset.directory)+'&name='+encodeURIComponent(f.name);let r=await fetch(u+(replaceAll?'&overwrite=1':''),{method:'PUT',body:f});")
-                        .append("if(r.status===409){let choice=skipAll?'skip':replaceAll?'replace':await askUploadConflict(f.name);if(choice==='cancel'){cancelled=true;break;}if(choice==='skip'){skipped++;continue;}if(choice==='skip-all'){skipAll=true;skipped++;continue;}if(choice==='replace-all')replaceAll=true;r=await fetch(u+'&overwrite=1',{method:'PUT',body:f});}")
-                        .append("if(!r.ok){failed++;statusBox.textContent=`${f.name}: ${await r.text()}`;}else{uploaded++;statusBox.textContent=`Uploaded ${uploaded}/${files.length}`;}")
-                        .append("}catch(error){failed++;statusBox.textContent=`Upload failed: ${f.name}`;}}")
-                        .append("e.target.value='';statusBox.textContent=`Upload finished: ${uploaded} uploaded, ${skipped} skipped, ${failed} failed${cancelled?' (remaining files cancelled)':''}. Refreshing...`;")
-                        .append("setTimeout(()=>location.reload(),1000);};");
+                        .append("for(let i=0;i<files.length;i++){const f=files[i];")
+                        .append("const setPct=p=>statusBox.textContent=`[${i+1}/${files.length}] Uploading ${f.name}: ${p}%`;setPct(0);")
+                        .append("try{let u='/upload?directory='+encodeURIComponent(document.body.dataset.directory)+'&name='+encodeURIComponent(f.name);let r=await xhrUpload(u+(replaceAll?'&overwrite=1':''),f,setPct);")
+                        .append("if(r.status===409){let choice=skipAll?'skip':replaceAll?'replace':await askUploadConflict(f.name);if(choice==='cancel'){cancelled=true;break;}if(choice==='skip'){skipped++;continue;}if(choice==='skip-all'){skipAll=true;skipped++;continue;}if(choice==='replace-all')replaceAll=true;r=await xhrUpload(u+'&overwrite=1',f,setPct);}")
+                        .append("if(!r.ok){failed++;statusBox.textContent=`[${i+1}/${files.length}] Failed: ${f.name} — ${r.text||'HTTP '+r.status}`;}else{uploaded++;statusBox.textContent=`[${i+1}/${files.length}] Uploaded ${f.name} ✓`;}")
+                        .append("}catch(error){failed++;statusBox.textContent=`[${i+1}/${files.length}] Error: ${f.name} — ${error.message||error}`;}}")
+                        .append("e.target.value='';statusBox.textContent=`Done: ${uploaded} uploaded, ${skipped} skipped, ${failed} failed${cancelled?' (cancelled)':''}. Refreshing...`;")
+                        .append("setTimeout(()=>location.reload(),1200);};");
             }
             page.append("</script></main></body></html>");
             return page.toString();
@@ -654,9 +671,13 @@ public final class HttpShareService extends Service {
             if (directory == null || !directory.isDirectory() || !directory.canWrite()) {
                 return text(Response.Status.FORBIDDEN, "Upload folder is unavailable");
             }
+            String contentLengthStr = session.getHeaders().get("content-length");
+            if (contentLengthStr == null) {
+                contentLengthStr = session.getHeaders().get("Content-Length");
+            }
             long contentLength;
             try {
-                contentLength = Long.parseLong(session.getHeaders().get("content-length"));
+                contentLength = Long.parseLong(contentLengthStr);
             } catch (RuntimeException exception) {
                 return text(Response.Status.LENGTH_REQUIRED, "Content-Length is required");
             }
@@ -708,21 +729,47 @@ public final class HttpShareService extends Service {
                 return 1;
             }
             if (!destination.exists()) {
-                return temporary.renameTo(destination) ? 0 : 2;
+                if (temporary.renameTo(destination)) {
+                    return 0;
+                }
+                return copyAndCleanup(temporary, destination) ? 0 : 2;
             }
             if (!overwrite || !destination.isFile()) {
                 return 1;
             }
             File backup = new File(destination.getParentFile(), ".backup-" + UUID.randomUUID());
             if (!destination.renameTo(backup)) {
-                return 2;
+                // Try copy-based swap instead
+                return copyAndCleanup(temporary, destination) ? 0 : 2;
             }
             if (temporary.renameTo(destination)) {
                 backup.delete();
                 return 0;
             }
+            if (copyAndCleanup(temporary, destination)) {
+                backup.delete();
+                return 0;
+            }
             backup.renameTo(destination);
             return 2;
+        }
+
+        private boolean copyAndCleanup(File source, File destination) {
+            try (InputStream in = new BufferedInputStream(new FileInputStream(source));
+                    OutputStream out = new BufferedOutputStream(new FileOutputStream(destination))) {
+                byte[] buf = new byte[64 * 1024];
+                int n;
+                while ((n = in.read(buf)) != -1) {
+                    out.write(buf, 0, n);
+                }
+                out.flush();
+                source.delete();
+                return true;
+            } catch (IOException e) {
+                destination.delete();
+                source.delete();
+                return false;
+            }
         }
 
         private File resolve(String relative) throws IOException {

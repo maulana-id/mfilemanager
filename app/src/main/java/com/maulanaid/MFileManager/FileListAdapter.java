@@ -80,6 +80,7 @@ public final class FileListAdapter extends ListAdapter<FileListAdapter.Row, Recy
         final boolean isStorageDevice;
         final int storageUsagePercent;
         final int customIcon;
+        boolean archiveEntry;
 
         private Row(File file, String title, String details, boolean selected,
                 int depth, boolean isDirectory, boolean isExpanded, boolean hasChildren,
@@ -108,6 +109,14 @@ public final class FileListAdapter extends ListAdapter<FileListAdapter.Row, Recy
                 int depth, boolean isDirectory, boolean isExpanded, boolean hasChildren) {
             return new Row(file, null, details, selected, depth, isDirectory, isExpanded,
                     hasChildren, true, false, 0, 0);
+        }
+
+        public static Row archiveNode(File file, String details, boolean selected,
+            int depth, boolean isDirectory, boolean isExpanded, boolean hasChildren) {
+            Row row = treeNode(file, details, selected, depth,
+                isDirectory, isExpanded, hasChildren);
+            row.archiveEntry = true;
+            return row;
         }
 
         public static Row storageDevice(File file, String title, String details,
@@ -144,6 +153,7 @@ public final class FileListAdapter extends ListAdapter<FileListAdapter.Row, Recy
                     && isStorageDevice == other.isStorageDevice
                     && storageUsagePercent == other.storageUsagePercent
                     && customIcon == other.customIcon
+                    && archiveEntry == other.archiveEntry
                     && Objects.equals(title, other.title)
                     && Objects.equals(details, other.details);
         }
@@ -372,7 +382,7 @@ public final class FileListAdapter extends ListAdapter<FileListAdapter.Row, Recy
                 return;
             }
 
-            String thumbnailKey = thumbnailKey(row.file);
+            String thumbnailKey = row.archiveEntry ? null : thumbnailKey(row.file);
             int iconResource = iconFor(row.file);
             if (thumbnailKey == null) {
                 icon.setTag(null);

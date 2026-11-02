@@ -41,6 +41,7 @@ import org.apache.ftpserver.listener.ListenerFactory;
 import org.apache.ftpserver.usermanager.Md5PasswordEncryptor;
 import org.apache.ftpserver.usermanager.PropertiesUserManagerFactory;
 import org.apache.ftpserver.usermanager.impl.BaseUser;
+import org.apache.ftpserver.usermanager.impl.WritePermission;
 
 import java.io.File;
 import java.io.IOException;
@@ -69,6 +70,7 @@ public final class FtpShareService extends Service {
     private static final String PREF_ERROR = "ftp_share_error";
     private static final String CHANNEL_ID = "ftp_file_share";
     private static final int NOTIFICATION_ID = 2121;
+    public static final String PREF_FTP_READONLY = "ftp_share_readonly";
 
     private FtpServer ftpServer;
     private File sharedRoot;
@@ -108,6 +110,7 @@ public final class FtpShareService extends Service {
             if (!isValidUsername(username) || password.length() < 8) {
                 throw new IOException("Set valid file-share credentials first");
             }
+            boolean readonly = preferences.getBoolean(PREF_FTP_READONLY, false);
 
             PropertiesUserManagerFactory userManagerFactory = new PropertiesUserManagerFactory();
             userFile = new File(getCacheDir(), "ftp-users.properties");
@@ -123,7 +126,13 @@ public final class FtpShareService extends Service {
             user.setPassword(password);
             user.setHomeDirectory(sharedRoot.getCanonicalPath());
             user.setMaxIdleTime(300);
-            user.setAuthorities(Collections.<Authority>emptyList());
+            if (readonly) {
+                user.setAuthorities(Collections.<Authority>emptyList());
+            } else {
+                List<Authority> authorities = new ArrayList<>();
+                authorities.add(new WritePermission());
+                user.setAuthorities(authorities);
+            }
             userManager.save(user);
 
             DataConnectionConfigurationFactory dataConfiguration = new DataConnectionConfigurationFactory();
@@ -152,7 +161,8 @@ public final class FtpShareService extends Service {
                     .putString(PREF_PATH, sharedRoot.getAbsolutePath())
                     .putString(PREF_URLS, urls)
                     .apply();
-            startForegroundCompat(buildNotification("Read-only share: " + sharedRoot.getName()
+            String accessMode = readonly ? "Read-only share: " : "Full-access share: ";
+            startForegroundCompat(buildNotification(accessMode + sharedRoot.getName()
                     + " on port " + PORT));
             notifyStatusChanged();
         } catch (Exception exception) {

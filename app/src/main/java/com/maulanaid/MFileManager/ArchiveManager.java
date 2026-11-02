@@ -174,7 +174,6 @@ public final class ArchiveManager {
             return entries;
         }
         if (name.endsWith(".gz") && !name.endsWith(".tar.gz") && !name.endsWith(".tgz")) {
-            long unpacked = 0;
             String originalName = removeArchiveExtension(archive);
             try (InputStream input = new GzipCompressorInputStream(
                     new BufferedInputStream(new FileInputStream(archive)), true)) {
@@ -182,13 +181,8 @@ public final class ArchiveManager {
                 if (storedName != null && !storedName.isEmpty()) {
                     originalName = storedName;
                 }
-                byte[] buffer = new byte[BUFFER_SIZE];
-                int count;
-                while ((count = input.read(buffer)) != -1) {
-                    unpacked += count;
-                }
             }
-            entries.add(new EntryInfo(originalName, unpacked,
+            entries.add(new EntryInfo(originalName, -1,
                     archive.length(), false));
             return entries;
         }
@@ -296,6 +290,257 @@ public final class ArchiveManager {
         } catch (Exception exception) {
             deleteRecursively(destination);
             throw exception;
+        }
+    }
+
+    public static int extractEntries(File archive, List<String> selectedEntries,
+            File destination, char[] password) throws Exception {
+        if (!isSupportedArchive(archive) || selectedEntries.isEmpty()) {
+            throw new IOException("Select at least one archive item");
+        }
+        if (!destination.isDirectory() || !destination.canWrite()) {
+            throw new IOException("Destination folder cannot be written");
+        }
+
+        List<SelectedEntry> selected = new ArrayList<>();
+        for (String entry : selectedEntries) {
+            SelectedEntry normalized = new SelectedEntry(entry);
+            boolean nested = false;
+            for (SelectedEntry accepted : selected) {
+                if (normalized.path.equals(accepted.path)
+                        || normalized.path.startsWith(accepted.path + "/")) {
+                    nested = true;
+                    break;
+                }
+            }
+            if (!nested) {
+                selected.add(normalized);
+            }
+        }
+
+        for (SelectedEntry entry : selected) {
+            if (entry.directory) {
+                File target = selectedTarget(destination, entry, entry.path);
+                if (!target.isDirectory() && !target.mkdirs()) {
+                    throw new IOException("Could not create extracted folder");
+                }
+            }
+        }
+
+        String name = archive.getName().toLowerCase(Locale.ROOT);
+        if (name.endsWith(".zip")) {
+            return extractZipEntries(archive, destination, selected, password);
+        }
+        if (name.endsWith(".7z")) {
+            return extractSevenZipEntries(archive, destination, selected, password);
+        }
+        if (name.endsWith(".rar")) {
+            return extractRarEntries(archive, destination, selected, password);
+        }
+        if (name.endsWith(".gz") && !name.endsWith(".tar.gz") && !name.endsWith(".tgz")) {
+            return extractGzipEntry(archive, destination, selected);
+        }
+        return extractTarEntries(archive, destination, selected,
+                name.endsWith(".tar.gz") || name.endsWith(".tgz"));
+    }
+
+    private static int extractZipEntries(File archive, File destination,
+            List<SelectedEntry> selected, char[] password) throws Exception {
+        int count = 0;
+        try (ZipFile zip = password == null || password.length == 0
+                ? new ZipFile(archive)
+                : new ZipFile(archive, password)) {
+            for (net.lingala.zip4j.model.FileHeader header : zip.getFileHeaders()) {
+                File target = selectedTarget(destination, selected, header.getFileName());
+                if (target == null) {
+                    continue;
+                }
+                if (header.isDirectory()) {
+                    if (!target.isDirectory() && !target.mkdirs()) {
+                        throw new IOException("Could not create extracted folder");
+                    }
+                    continue;
+                }
+                ensureParent(target);
+                try (InputStream input = zip.getInputStream(header);
+                        OutputStream output = new BufferedOutputStream(new FileOutputStream(target))) {
+                    copy(input, output);
+                }
+                count++;
+            }
+        }
+        return count;
+    }
+
+    private static int extractSevenZipEntries(File archive, File destination,
+            List<SelectedEntry> selected, char[] password) throws IOException {
+        int count = 0;
+        try (SevenZFile sevenZ = password == null || password.length == 0
+                ? new SevenZFile(archive)
+                : new SevenZFile(archive, password)) {
+            SevenZArchiveEntry entry;
+            while ((entry = sevenZ.getNextEntry()) != null) {
+                File target = selectedTarget(destination, selected, entry.getName());
+                if (entry.isDirectory()) {
+                    if (target != null && !target.isDirectory() && !target.mkdirs()) {
+                        throw new IOException("Could not create extracted folder");
+                    }
+                    continue;
+                }
+                if (target == null) {
+                    drainSevenZipEntry(sevenZ);
+                    continue;
+                }
+                ensureParent(target);
+                try (OutputStream output = new BufferedOutputStream(new FileOutputStream(target))) {
+                    byte[] buffer = new byte[BUFFER_SIZE];
+                    int read;
+                    while ((read = sevenZ.read(buffer)) != -1) {
+                        output.write(buffer, 0, read);
+                    }
+                }
+                count++;
+            }
+        }
+        return count;
+    }
+
+    private static void drainSevenZipEntry(SevenZFile sevenZ) throws IOException {
+        byte[] buffer = new byte[BUFFER_SIZE];
+        while (sevenZ.read(buffer) != -1) {
+            // Advance past unselected data so the next archive entry can be read.
+        }
+    }
+
+    private static int extractRarEntries(File archive, File destination,
+            List<SelectedEntry> selected, char[] password) throws Exception {
+        int count = 0;
+        try (Archive rar = password == null || password.length == 0
+                ? new Archive(archive)
+                : new Archive(archive, new String(password))) {
+            for (FileHeader header : rar.getFileHeaders()) {
+                File target = selectedTarget(destination, selected, header.getFileName());
+                if (target == null) {
+                    continue;
+                }
+                if (header.isDirectory()) {
+                    if (!target.isDirectory() && !target.mkdirs()) {
+                        throw new IOException("Could not create extracted folder");
+                    }
+                    continue;
+                }
+                ensureParent(target);
+                try (OutputStream output = new BufferedOutputStream(new FileOutputStream(target))) {
+                    rar.extractFile(header, output);
+                }
+                count++;
+            }
+        }
+        return count;
+    }
+
+    private static int extractTarEntries(File archive, File destination,
+            List<SelectedEntry> selected, boolean gzip) throws IOException {
+        int count = 0;
+        try (TarArchiveInputStream tar = openTarInput(archive, gzip)) {
+            TarArchiveEntry entry;
+            while ((entry = tar.getNextTarEntry()) != null) {
+                File target = selectedTarget(destination, selected, entry.getName());
+                if (target == null || entry.isSymbolicLink() || entry.isLink()) {
+                    continue;
+                }
+                if (entry.isDirectory()) {
+                    if (!target.isDirectory() && !target.mkdirs()) {
+                        throw new IOException("Could not create extracted folder");
+                    }
+                    continue;
+                }
+                if (!entry.isFile()) {
+                    continue;
+                }
+                ensureParent(target);
+                try (OutputStream output = new BufferedOutputStream(new FileOutputStream(target))) {
+                    copy(tar, output);
+                }
+                count++;
+            }
+        }
+        return count;
+    }
+
+    private static int extractGzipEntry(File archive, File destination,
+            List<SelectedEntry> selected) throws IOException {
+        try (InputStream input = new GzipCompressorInputStream(
+                new BufferedInputStream(new FileInputStream(archive)), true)) {
+            String storedName = ((GzipCompressorInputStream) input).getMetaData().getFilename();
+            String entryName = storedName == null || storedName.isEmpty()
+                    ? removeArchiveExtension(archive) : storedName;
+            File target = selectedTarget(destination, selected, entryName);
+            if (target == null) {
+                return 0;
+            }
+            ensureParent(target);
+            try (OutputStream output = new BufferedOutputStream(new FileOutputStream(target))) {
+                copy(input, output);
+            }
+            return 1;
+        }
+    }
+
+    private static File selectedTarget(File destination, List<SelectedEntry> selected,
+            String entryName) throws IOException {
+        String normalized;
+        try {
+            normalized = normalizeEntryName(entryName);
+        } catch (IOException ignored) {
+            return null;
+        }
+        for (SelectedEntry root : selected) {
+            if (normalized.equals(root.path)) {
+                return selectedTarget(destination, root, root.path);
+            }
+            if (root.directory && normalized.startsWith(root.path + "/")) {
+                return selectedTarget(destination, root, normalized);
+            }
+        }
+        return null;
+    }
+
+    private static File selectedTarget(File destination, SelectedEntry root,
+            String entryName) throws IOException {
+        String relative = entryName.equals(root.path) ? "" : entryName.substring(root.path.length() + 1);
+        String outputName = root.outputName + (relative.isEmpty() ? "" : "/" + relative);
+        return safeTarget(destination, outputName);
+    }
+
+    private static String normalizeEntryName(String entryName) throws IOException {
+        String normalized = entryName.replace('\\', '/');
+        while (normalized.endsWith("/")) {
+            normalized = normalized.substring(0, normalized.length() - 1);
+        }
+        if (normalized.isEmpty() || normalized.startsWith("/")
+                || normalized.matches("^[A-Za-z]:.*")) {
+            throw new IOException("Archive contains an invalid path");
+        }
+        for (String part : normalized.split("/")) {
+            if (part.isEmpty() || ".".equals(part) || "..".equals(part)) {
+                throw new IOException("Archive contains an invalid path");
+            }
+        }
+        return normalized;
+    }
+
+    private static final class SelectedEntry {
+        final String path;
+        final String outputName;
+        final boolean directory;
+
+        SelectedEntry(String entryName) throws IOException {
+            String normalized = entryName.replace('\\', '/');
+            directory = normalized.endsWith("/");
+            path = normalizeEntryName(normalized);
+            int separator = path.lastIndexOf('/');
+            outputName = path.substring(separator + 1);
         }
     }
 
