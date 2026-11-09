@@ -19,6 +19,9 @@
 package com.maulanaid.MFileManager;
 
 import android.Manifest;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.content.BroadcastReceiver;
 import android.content.ClipData;
 import android.content.ClipboardManager;
@@ -60,6 +63,7 @@ import android.widget.Toast;
 
 import androidx.core.content.FileProvider;
 import androidx.core.content.ContextCompat;
+import androidx.core.app.NotificationCompat;
 import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatDelegate;
 import androidx.appcompat.app.AppCompatActivity;
@@ -115,6 +119,8 @@ public class MainActivity extends AppCompatActivity {
     private static final int CONFLICT_REPLACE_ALL = 1;
     private static final int CONFLICT_SKIP_ALL = 2;
     private static final int NOTIFICATION_PERMISSION_REQUEST_CODE = 101;
+    private static final String FILE_OPERATION_CHANNEL_ID = "file_operations";
+    private static final int FILE_OPERATION_NOTIFICATION_ID = 2122;
     private static final long DOUBLE_BACK_EXIT_WINDOW_MS = 2000;
     private static final String PREF_HTTP_PASSWORD = "http_share_password";
     private static final String PREF_HTTP_USERNAME = "http_share_username";
@@ -180,6 +186,12 @@ public class MainActivity extends AppCompatActivity {
     private String pendingHttpSharePath;
     private boolean pendingFtpShare;
     private File pendingInstallFile;
+    private boolean operationNotificationPermissionRequested;
+    private boolean operationNotificationPermissionPending;
+    private String activeOperationTitle;
+    private String activeOperationFile;
+    private int activeOperationPercent = -1;
+    private long activeOperationSpeedBytesPerSecond;
     private boolean shareStatusReceiverRegistered;
     private final BroadcastReceiver shareStatusReceiver = new BroadcastReceiver() {
         @Override
@@ -506,6 +518,17 @@ public class MainActivity extends AppCompatActivity {
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         if (requestCode == NOTIFICATION_PERMISSION_REQUEST_CODE) {
+            boolean operationPermissionRequest = operationNotificationPermissionPending;
+            operationNotificationPermissionPending = false;
+            if (operationPermissionRequest && grantResults.length > 0
+                    && grantResults[0] == PackageManager.PERMISSION_GRANTED
+                    && activeOperationTitle != null) {
+                postOperationNotification(activeOperationTitle, activeOperationFile,
+                            activeOperationPercent, activeOperationSpeedBytesPerSecond);
+            }
+            if (operationPermissionRequest && pendingHttpSharePath == null) {
+                return;
+            }
             if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
                 launchPendingShare();
             } else {
@@ -1714,7 +1737,7 @@ public class MainActivity extends AppCompatActivity {
                     char[] password = archivePasswordInput == null ? new char[0]
                             : archivePasswordInput.getText().toString().toCharArray();
                     dialog.dismiss();
-                    runArchiveOperation("Creating " + output.getName(), () -> {
+                    runArchiveOperation("Creating " + output.getName(), progress -> {
                         try {
                             ArchiveManager.Result result = ArchiveManager.create(sources,
                                     output, format, password.length == 0 ? null : password);
@@ -1784,10 +1807,23 @@ public class MainActivity extends AppCompatActivity {
                     char[] password = passwordInput.getText().toString().toCharArray();
                     dialog.dismiss();
                     if (extract) {
-                        runArchiveOperation("Extracting " + archive.getName(), () -> {
+                        runArchiveOperation("Extracting " + archive.getName(), progress -> {
                             try {
+                                progress.update("Scanning archive", 0, 0, 0, 0);
+                                List<ArchiveManager.EntryInfo> entries = ArchiveManager.listEntries(
+                                        archive, password.length == 0 ? null : password);
+                                int totalFiles = 0;
+                                for (ArchiveManager.EntryInfo entry : entries) {
+                                    if (!entry.directory) {
+                                        totalFiles++;
+                                    }
+                                }
+                                int extractionTotal = totalFiles;
                                 int count = ArchiveManager.extract(archive, extractFolder,
-                                        password.length == 0 ? null : password);
+                                        password.length == 0 ? null : password,
+                                        (fileName, completed, bytesCopied, totalBytes) ->
+                                            progress.update(fileName, completed,
+                                                extractionTotal, bytesCopied, totalBytes));
                                 return "Extracted " + count + " file(s) to "
                                         + extractFolder.getAbsolutePath();
                             } finally {
@@ -2113,28 +2149,98 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void runArchiveOperation(String title, ArchiveOperation operation, boolean refresh) {
-        ProgressBar progress = new ProgressBar(this);
+        runArchiveOperation(title, operation, refresh, true, null);
+    }
+
+    private void runArchiveOperation(String title, ArchiveOperation operation, boolean refresh,
+            boolean showResult, Runnable onComplete) {
+        ProgressBar progress = new ProgressBar(this, null,
+                android.R.attr.progressBarStyleHorizontal);
+        progress.setIndeterminate(true);
+        TextView progressText = new TextView(this);
+        progressText.setText("Preparing...");
         LinearLayout progressContainer = new LinearLayout(this);
-        progressContainer.setPadding(32, 16, 32, 16);
+        progressContainer.setOrientation(LinearLayout.VERTICAL);
+        progressContainer.setPadding(48, 24, 48, 8);
         progressContainer.addView(progress, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        LinearLayout.LayoutParams progressTextParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        progressTextParams.topMargin = 12;
+        progressContainer.addView(progressText, progressTextParams);
         AlertDialog progressDialog = new AlertDialog.Builder(this)
                 .setTitle(title)
                 .setView(progressContainer)
                 .setCancelable(false)
                 .create();
         progressDialog.show();
+        requestOperationNotificationPermission();
+        postOperationNotification(title, "Preparing...", -1, 0);
+        long[] lastProgressUpdateAt = { 0 };
+        String[] sampledFile = { null };
+        long[] sampledAt = { 0 };
+        long[] sampledBytes = { 0 };
+        long[] speedBytesPerSecond = { 0 };
         archiveExecutor.execute(() -> {
             String result = null;
             Exception failure = null;
             try {
-                result = operation.run();
+                result = operation.run((currentFile, completed, total,
+                        fileBytesCopied, fileTotalBytes) -> {
+                    long now = SystemClock.elapsedRealtime();
+                    if (!currentFile.equals(sampledFile[0])) {
+                        sampledFile[0] = currentFile;
+                        sampledAt[0] = now;
+                        sampledBytes[0] = fileBytesCopied;
+                        speedBytesPerSecond[0] = 0;
+                    } else if (fileTotalBytes > 0 && now > sampledAt[0]) {
+                        long elapsed = now - sampledAt[0];
+                        long deltaBytes = Math.max(0, fileBytesCopied - sampledBytes[0]);
+                        speedBytesPerSecond[0] = deltaBytes * 1000 / elapsed;
+                        sampledAt[0] = now;
+                        sampledBytes[0] = fileBytesCopied;
+                    }
+                    if (lastProgressUpdateAt[0] == 0
+                            || now - lastProgressUpdateAt[0] >= 100) {
+                        lastProgressUpdateAt[0] = now;
+                        int percent = fileTotalBytes > 0
+                                ? (int) Math.min(100, fileBytesCopied * 100 / fileTotalBytes)
+                                : total > 0
+                                        ? (int) Math.min(100, (long) completed * 100 / total)
+                                        : -1;
+                        long speed = speedBytesPerSecond[0];
+                        String speedText = fileTotalBytes > 0
+                            ? (speed > 0
+                                ? String.format(Locale.getDefault(), "%.2f MB/s",
+                                    speed / (1024.0 * 1024.0))
+                                : "Measuring speed...")
+                                : null;
+                        String details = (percent >= 0 ? percent + "%" : "Working...")
+                                + (speedText == null ? "" : " | " + speedText)
+                                + "\n" + currentFile;
+                        mainHandler.post(() -> {
+                            if (progressDialog.isShowing()) {
+                                progress.setIndeterminate(percent < 0);
+                                if (percent >= 0) {
+                                    progress.setProgress(percent);
+                                }
+                                progressText.setText(details);
+                            }
+                            postOperationNotification(title, details, percent, speed);
+                        });
+                    }
+                });
             } catch (Exception exception) {
                 failure = exception;
             }
             String completedResult = result;
             Exception completedFailure = failure;
             mainHandler.post(() -> {
+                cancelOperationNotification();
+                activeOperationTitle = null;
+                activeOperationFile = null;
+                activeOperationPercent = -1;
+                activeOperationSpeedBytesPerSecond = 0;
                 if (isFinishing() || isDestroyed()) {
                     return;
                 }
@@ -2142,26 +2248,92 @@ public class MainActivity extends AppCompatActivity {
                 if (completedFailure != null) {
                     String message = completedFailure.getMessage();
                     new AlertDialog.Builder(this)
-                            .setTitle("Archive operation failed")
-                            .setMessage(message == null ? "The archive could not be processed." : message)
+                            .setTitle("Operation failed")
+                            .setMessage(message == null ? "The operation could not be completed." : message)
                             .setPositiveButton("OK", null)
                             .show();
+                    if (onComplete != null) {
+                        onComplete.run();
+                    }
                     return;
                 }
                 if (refresh) {
                     showFiles();
                 }
-                new AlertDialog.Builder(this)
-                        .setTitle(title)
-                        .setMessage(completedResult)
-                        .setPositiveButton("OK", null)
-                        .show();
+                if (showResult) {
+                    new AlertDialog.Builder(this)
+                            .setTitle(title)
+                            .setMessage(completedResult)
+                            .setPositiveButton("OK", null)
+                            .show();
+                }
+                if (onComplete != null) {
+                    onComplete.run();
+                }
             });
         });
     }
 
     private interface ArchiveOperation {
-        String run() throws Exception;
+        String run(OperationProgress progress) throws Exception;
+    }
+
+    private interface OperationProgress {
+        void update(String currentFile, int completed, int total,
+                long fileBytesCopied, long fileTotalBytes);
+    }
+
+    private void postOperationNotification(String title, String currentFile, int percent,
+            long speedBytesPerSecond) {
+        activeOperationTitle = title;
+        activeOperationFile = currentFile;
+        activeOperationPercent = percent;
+        activeOperationSpeedBytesPerSecond = speedBytesPerSecond;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                        != PackageManager.PERMISSION_GRANTED) {
+            return;
+        }
+        NotificationManager manager = getSystemService(NotificationManager.class);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                && manager.getNotificationChannel(FILE_OPERATION_CHANNEL_ID) == null) {
+            NotificationChannel channel = new NotificationChannel(FILE_OPERATION_CHANNEL_ID,
+                    "File operations", NotificationManager.IMPORTANCE_LOW);
+            manager.createNotificationChannel(channel);
+        }
+        Intent intent = new Intent(this, MainActivity.class);
+        intent.setFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        PendingIntent pendingIntent = PendingIntent.getActivity(this, 0, intent,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        String notificationTitle = percent >= 0 ? title + " - " + percent + "%" : title;
+        NotificationCompat.Builder notification = new NotificationCompat.Builder(this,
+                FILE_OPERATION_CHANNEL_ID)
+                .setSmallIcon(R.drawable.ic_notification_share)
+                .setContentTitle(notificationTitle)
+                .setContentText(currentFile.replace('\n', ' '))
+                .setStyle(new NotificationCompat.BigTextStyle().bigText(currentFile))
+                .setContentIntent(pendingIntent)
+                .setOnlyAlertOnce(true)
+                .setOngoing(true)
+                .setProgress(100, Math.max(0, percent), percent < 0);
+        manager.notify(FILE_OPERATION_NOTIFICATION_ID, notification.build());
+    }
+
+    private void requestOperationNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                        != PackageManager.PERMISSION_GRANTED
+                && !operationNotificationPermissionRequested) {
+            operationNotificationPermissionRequested = true;
+            operationNotificationPermissionPending = true;
+            requestPermissions(new String[] { Manifest.permission.POST_NOTIFICATIONS },
+                    NOTIFICATION_PERMISSION_REQUEST_CODE);
+        }
+    }
+
+    private void cancelOperationNotification() {
+        NotificationManager manager = getSystemService(NotificationManager.class);
+        manager.cancel(FILE_OPERATION_NOTIFICATION_ID);
     }
 
     private void copySelected() {
@@ -2284,7 +2456,7 @@ public class MainActivity extends AppCompatActivity {
         File archive = archiveClipboardFile;
         List<String> entries = new ArrayList<>(archiveClipboardEntries);
         char[] password = archiveClipboardPassword.clone();
-        runArchiveOperation("Extracting selected archive items", () -> {
+        runArchiveOperation("Extracting selected archive items", progress -> {
             int copied = 0;
             int skipped = 0;
             int failed = 0;
@@ -2294,14 +2466,20 @@ public class MainActivity extends AppCompatActivity {
                             ? entry.substring(0, entry.length() - 1) : entry;
                     int separator = path.lastIndexOf('/');
                     String outputName = path.substring(separator + 1);
+                    int completed = copied + skipped + failed;
+                    progress.update(outputName, completed, entries.size(), 0, 0);
                     if (new File(targetDirectory, outputName).exists()) {
                         skipped++;
+                        progress.update(outputName, completed + 1, entries.size(), 0, 0);
                         continue;
                     }
                     try {
                         int extracted = ArchiveManager.extractEntries(archive,
                                 Collections.singletonList(entry), targetDirectory,
-                                password.length == 0 ? null : password);
+                            password.length == 0 ? null : password,
+                            (fileName, extractedFiles, bytesCopied, totalBytes) ->
+                                progress.update(fileName, completed, entries.size(),
+                                    bytesCopied, totalBytes));
                         if (extracted > 0 || entry.endsWith("/")) {
                             copied++;
                         } else {
@@ -2311,6 +2489,8 @@ public class MainActivity extends AppCompatActivity {
                         deleteRecursively(new File(targetDirectory, outputName));
                         failed++;
                     }
+                        progress.update(outputName, copied + skipped + failed,
+                            entries.size(), 0, 0);
                 }
                 return "Paste complete. " + copied + " copied, " + skipped
                         + " skipped, " + failed + " failed";
@@ -2353,9 +2533,9 @@ public class MainActivity extends AppCompatActivity {
                     .setItems(choices, (dialog, choice) -> {
                         switch (choice) {
                             case 0:
-                                copyPasteItem(source, destination, progress);
-                                processPasteItem(sources, index + 1, targetDirectory,
-                                        CONFLICT_ASK, progress);
+                                copyPasteItem(source, destination, progress,
+                                    () -> processPasteItem(sources, index + 1,
+                                        targetDirectory, CONFLICT_ASK, progress));
                                 break;
                             case 1:
                                 progress.skipped++;
@@ -2363,9 +2543,9 @@ public class MainActivity extends AppCompatActivity {
                                         CONFLICT_ASK, progress);
                                 break;
                             case 2:
-                                copyPasteItem(source, destination, progress);
-                                processPasteItem(sources, index + 1, targetDirectory,
-                                        CONFLICT_REPLACE_ALL, progress);
+                                copyPasteItem(source, destination, progress,
+                                    () -> processPasteItem(sources, index + 1,
+                                        targetDirectory, CONFLICT_REPLACE_ALL, progress));
                                 break;
                             case 3:
                                 progress.skipped++;
@@ -2384,19 +2564,27 @@ public class MainActivity extends AppCompatActivity {
 
         if (destination.exists() && conflictPolicy == CONFLICT_SKIP_ALL) {
             progress.skipped++;
-        } else {
-            copyPasteItem(source, destination, progress);
+            processPasteItem(sources, index + 1, targetDirectory, conflictPolicy, progress);
+            return;
         }
-        processPasteItem(sources, index + 1, targetDirectory, conflictPolicy, progress);
+        copyPasteItem(source, destination, progress,
+                () -> processPasteItem(sources, index + 1,
+                        targetDirectory, conflictPolicy, progress));
     }
 
-    private void copyPasteItem(File source, File destination, PasteProgress progress) {
-        try {
-            copyRecursively(source, destination);
-            progress.copied++;
-        } catch (IOException exception) {
-            progress.failed++;
-        }
+    private void copyPasteItem(File source, File destination, PasteProgress pasteProgress,
+            Runnable onComplete) {
+        runArchiveOperation("Copying " + source.getName(), progress -> {
+            int total = countItemsRecursively(source);
+            int[] completed = { 0 };
+            try {
+                copyRecursively(source, destination, total, completed, progress);
+                pasteProgress.copied++;
+            } catch (IOException exception) {
+                pasteProgress.failed++;
+            }
+            return null;
+        }, false, false, onComplete);
     }
 
     private void finishPaste(PasteProgress progress, boolean cancelled) {
@@ -2418,18 +2606,24 @@ public class MainActivity extends AppCompatActivity {
                 .setMessage("Folders and their contents will be deleted recursively.")
                 .setNegativeButton("Cancel", null)
                 .setPositiveButton("Delete", (dialog, which) -> {
-                    int deleted = 0;
-                    int failed = 0;
-                    for (File file : files) {
-                        if (deleteRecursively(file)) {
-                            deleted++;
-                        } else {
-                            failed++;
-                        }
-                    }
                     selectedFiles.clear();
-                    showFiles();
-                    toast(deleted + " deleted, " + failed + " failed");
+                    runArchiveOperation("Deleting files", progress -> {
+                        int total = 0;
+                        for (File file : files) {
+                            total += countItemsRecursively(file);
+                        }
+                        int[] completed = { 0 };
+                        int deleted = 0;
+                        int failed = 0;
+                        for (File file : files) {
+                            if (deleteRecursively(file, total, completed, progress)) {
+                                deleted++;
+                            } else {
+                                failed++;
+                            }
+                        }
+                        return deleted + " deleted, " + failed + " failed";
+                    }, true);
                 })
                 .show();
     }
@@ -2645,7 +2839,9 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    private void copyRecursively(File source, File destination) throws IOException {
+    private void copyRecursively(File source, File destination, int total, int[] completed,
+            OperationProgress progress) throws IOException {
+        progress.update(source.getAbsolutePath(), completed[0], total, 0, 0);
         if (source.isDirectory()) {
             if (destination.exists() && !destination.isDirectory()
                     && !deleteRecursively(destination)) {
@@ -2659,38 +2855,82 @@ public class MainActivity extends AppCompatActivity {
                 throw new IOException("Cannot read source folder");
             }
             for (File child : children) {
-                copyRecursively(child, new File(destination, child.getName()));
+                copyRecursively(child, new File(destination, child.getName()),
+                        total, completed, progress);
             }
+            completed[0]++;
+            progress.update(source.getAbsolutePath(), completed[0], total, 0, 0);
         } else {
             if (destination.exists() && destination.isDirectory()
                     && !deleteRecursively(destination)) {
                 throw new IOException("Cannot replace destination folder");
             }
-            copyFile(source, destination);
+            copyFile(source, destination, completed, total, progress);
         }
     }
 
-    private void copyFile(File source, File destination) throws IOException {
+    private void copyFile(File source, File destination, int[] completed, int total,
+            OperationProgress progress) throws IOException {
         byte[] buffer = new byte[8192];
+        long fileTotalBytes = source.length();
+        long bytesCopied = 0;
         try (FileInputStream input = new FileInputStream(source);
                 FileOutputStream output = new FileOutputStream(destination)) {
+            progress.update(source.getAbsolutePath(), completed[0], total,
+                    bytesCopied, fileTotalBytes);
             int bytesRead;
             while ((bytesRead = input.read(buffer)) != -1) {
                 output.write(buffer, 0, bytesRead);
+                bytesCopied += bytesRead;
+                progress.update(source.getAbsolutePath(), completed[0], total,
+                        bytesCopied, fileTotalBytes);
             }
         }
+        completed[0]++;
+        progress.update(source.getAbsolutePath(), completed[0], total,
+                bytesCopied, fileTotalBytes);
     }
 
     private boolean deleteRecursively(File file) {
+        return deleteRecursively(file, 0, null, null);
+    }
+
+    private int countItemsRecursively(File file) {
+        int count = 0;
+        List<File> pending = new ArrayList<>();
+        pending.add(file);
+        while (!pending.isEmpty()) {
+            File current = pending.remove(pending.size() - 1);
+            count++;
+            if (current.isDirectory()) {
+                File[] children = current.listFiles();
+                if (children != null) {
+                    Collections.addAll(pending, children);
+                }
+            }
+        }
+        return count;
+    }
+
+    private boolean deleteRecursively(File file, int total, int[] completed,
+            OperationProgress progress) {
         File[] children = file.isDirectory() ? file.listFiles() : null;
+        if (completed != null) {
+            progress.update(file.getAbsolutePath(), completed[0], total, 0, 0);
+        }
         if (children != null) {
             for (File child : children) {
-                if (!deleteRecursively(child)) {
+                if (!deleteRecursively(child, total, completed, progress)) {
                     return false;
                 }
             }
         }
-        return file.delete();
+        boolean deleted = file.delete();
+        if (completed != null) {
+            completed[0]++;
+            progress.update(file.getAbsolutePath(), completed[0], total, 0, 0);
+        }
+        return deleted;
     }
 
     private void updateSelection() {

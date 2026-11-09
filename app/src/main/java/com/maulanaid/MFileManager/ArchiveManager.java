@@ -43,9 +43,11 @@ import java.io.BufferedOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.FilterOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.RandomAccessFile;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
@@ -102,6 +104,11 @@ public final class ArchiveManager {
             }
             return (1.0 - (double) archiveBytes / originalBytes) * 100.0;
         }
+    }
+
+    public interface ProgressListener {
+        void onFileProgress(String fileName, int completedFiles, long bytesCopied,
+            long totalBytes);
     }
 
     private static final int BUFFER_SIZE = 32 * 1024;
@@ -264,6 +271,11 @@ public final class ArchiveManager {
     }
 
     public static int extract(File archive, File destination, char[] password) throws Exception {
+        return extract(archive, destination, password, null);
+    }
+
+    public static int extract(File archive, File destination, char[] password,
+            ProgressListener progressListener) throws Exception {
         if (!isSupportedArchive(archive)) {
             throw new IOException("Unsupported archive format");
         }
@@ -273,20 +285,20 @@ public final class ArchiveManager {
         try {
             String name = archive.getName().toLowerCase(Locale.ROOT);
             if (name.endsWith(".zip")) {
-                return extractZip(archive, destination, password);
+                return extractZip(archive, destination, password, progressListener);
             }
             if (name.endsWith(".7z")) {
-                return extractSevenZip(archive, destination, password);
+                return extractSevenZip(archive, destination, password, progressListener);
             }
             if (name.endsWith(".rar")) {
-                return extractRar(archive, destination, password);
+                return extractRar(archive, destination, password, progressListener);
             }
             if (name.endsWith(".gz") && !name.endsWith(".tar.gz") && !name.endsWith(".tgz")) {
-                extractGzip(archive, destination);
+                extractGzip(archive, destination, progressListener);
                 return 1;
             }
             return extractTar(archive, destination,
-                    name.endsWith(".tar.gz") || name.endsWith(".tgz"));
+                    name.endsWith(".tar.gz") || name.endsWith(".tgz"), progressListener);
         } catch (Exception exception) {
             deleteRecursively(destination);
             throw exception;
@@ -295,6 +307,11 @@ public final class ArchiveManager {
 
     public static int extractEntries(File archive, List<String> selectedEntries,
             File destination, char[] password) throws Exception {
+        return extractEntries(archive, selectedEntries, destination, password, null);
+        }
+
+        public static int extractEntries(File archive, List<String> selectedEntries,
+            File destination, char[] password, ProgressListener progressListener) throws Exception {
         if (!isSupportedArchive(archive) || selectedEntries.isEmpty()) {
             throw new IOException("Select at least one archive item");
         }
@@ -329,23 +346,25 @@ public final class ArchiveManager {
 
         String name = archive.getName().toLowerCase(Locale.ROOT);
         if (name.endsWith(".zip")) {
-            return extractZipEntries(archive, destination, selected, password);
+            return extractZipEntries(archive, destination, selected, password, progressListener);
         }
         if (name.endsWith(".7z")) {
-            return extractSevenZipEntries(archive, destination, selected, password);
+            return extractSevenZipEntries(archive, destination, selected, password,
+                    progressListener);
         }
         if (name.endsWith(".rar")) {
-            return extractRarEntries(archive, destination, selected, password);
+            return extractRarEntries(archive, destination, selected, password, progressListener);
         }
         if (name.endsWith(".gz") && !name.endsWith(".tar.gz") && !name.endsWith(".tgz")) {
-            return extractGzipEntry(archive, destination, selected);
+            return extractGzipEntry(archive, destination, selected, progressListener);
         }
         return extractTarEntries(archive, destination, selected,
-                name.endsWith(".tar.gz") || name.endsWith(".tgz"));
+                name.endsWith(".tar.gz") || name.endsWith(".tgz"), progressListener);
     }
 
     private static int extractZipEntries(File archive, File destination,
-            List<SelectedEntry> selected, char[] password) throws Exception {
+            List<SelectedEntry> selected, char[] password, ProgressListener progressListener)
+            throws Exception {
         int count = 0;
         try (ZipFile zip = password == null || password.length == 0
                 ? new ZipFile(archive)
@@ -361,19 +380,24 @@ public final class ArchiveManager {
                     }
                     continue;
                 }
+                long totalBytes = Math.max(0, header.getUncompressedSize());
+                String fileName = target.getAbsolutePath();
+                reportFileProgress(progressListener, fileName, count, 0, totalBytes);
                 ensureParent(target);
                 try (InputStream input = zip.getInputStream(header);
                         OutputStream output = new BufferedOutputStream(new FileOutputStream(target))) {
-                    copy(input, output);
+                    copyWithProgress(input, output, progressListener, fileName, count, totalBytes);
                 }
                 count++;
+                reportFileProgress(progressListener, fileName, count, totalBytes, totalBytes);
             }
         }
         return count;
     }
 
     private static int extractSevenZipEntries(File archive, File destination,
-            List<SelectedEntry> selected, char[] password) throws IOException {
+            List<SelectedEntry> selected, char[] password, ProgressListener progressListener)
+            throws IOException {
         int count = 0;
         try (SevenZFile sevenZ = password == null || password.length == 0
                 ? new SevenZFile(archive)
@@ -391,15 +415,23 @@ public final class ArchiveManager {
                     drainSevenZipEntry(sevenZ);
                     continue;
                 }
+                long totalBytes = Math.max(0, entry.getSize());
+                String fileName = target.getAbsolutePath();
+                reportFileProgress(progressListener, fileName, count, 0, totalBytes);
                 ensureParent(target);
+                long[] outputBytesWritten = { 0 };
                 try (OutputStream output = new BufferedOutputStream(new FileOutputStream(target))) {
                     byte[] buffer = new byte[BUFFER_SIZE];
                     int read;
                     while ((read = sevenZ.read(buffer)) != -1) {
                         output.write(buffer, 0, read);
+                        outputBytesWritten[0] += read;
+                        reportFileProgress(progressListener, fileName, count,
+                                outputBytesWritten[0], totalBytes);
                     }
                 }
                 count++;
+                reportFileProgress(progressListener, fileName, count, totalBytes, totalBytes);
             }
         }
         return count;
@@ -413,7 +445,8 @@ public final class ArchiveManager {
     }
 
     private static int extractRarEntries(File archive, File destination,
-            List<SelectedEntry> selected, char[] password) throws Exception {
+            List<SelectedEntry> selected, char[] password, ProgressListener progressListener)
+            throws Exception {
         int count = 0;
         try (Archive rar = password == null || password.length == 0
                 ? new Archive(archive)
@@ -429,18 +462,42 @@ public final class ArchiveManager {
                     }
                     continue;
                 }
+                long totalBytes = Math.max(0, header.getFullUnpackSize());
+                String fileName = target.getAbsolutePath();
+                reportFileProgress(progressListener, fileName, count, 0, totalBytes);
                 ensureParent(target);
-                try (OutputStream output = new BufferedOutputStream(new FileOutputStream(target))) {
+                int fileIndex = count;
+                long[] outputBytesWritten = { 0 };
+                try (OutputStream rawOutput = new BufferedOutputStream(new FileOutputStream(target));
+                        OutputStream output = new FilterOutputStream(rawOutput) {
+                            @Override
+                            public void write(int value) throws IOException {
+                                out.write(value);
+                                reportFileProgress(progressListener, fileName, fileIndex,
+                                        ++outputBytesWritten[0], totalBytes);
+                            }
+
+                            @Override
+                            public void write(byte[] buffer, int offset, int length)
+                                    throws IOException {
+                                out.write(buffer, offset, length);
+                                outputBytesWritten[0] += length;
+                                reportFileProgress(progressListener, fileName, fileIndex,
+                                        outputBytesWritten[0], totalBytes);
+                            }
+                        }) {
                     rar.extractFile(header, output);
                 }
                 count++;
+                reportFileProgress(progressListener, fileName, count, totalBytes, totalBytes);
             }
         }
         return count;
     }
 
     private static int extractTarEntries(File archive, File destination,
-            List<SelectedEntry> selected, boolean gzip) throws IOException {
+            List<SelectedEntry> selected, boolean gzip, ProgressListener progressListener)
+            throws IOException {
         int count = 0;
         try (TarArchiveInputStream tar = openTarInput(archive, gzip)) {
             TarArchiveEntry entry;
@@ -458,18 +515,22 @@ public final class ArchiveManager {
                 if (!entry.isFile()) {
                     continue;
                 }
+                long totalBytes = Math.max(0, entry.getSize());
+                String fileName = target.getAbsolutePath();
+                reportFileProgress(progressListener, fileName, count, 0, totalBytes);
                 ensureParent(target);
                 try (OutputStream output = new BufferedOutputStream(new FileOutputStream(target))) {
-                    copy(tar, output);
+                    copyWithProgress(tar, output, progressListener, fileName, count, totalBytes);
                 }
                 count++;
+                reportFileProgress(progressListener, fileName, count, totalBytes, totalBytes);
             }
         }
         return count;
     }
 
     private static int extractGzipEntry(File archive, File destination,
-            List<SelectedEntry> selected) throws IOException {
+            List<SelectedEntry> selected, ProgressListener progressListener) throws IOException {
         try (InputStream input = new GzipCompressorInputStream(
                 new BufferedInputStream(new FileInputStream(archive)), true)) {
             String storedName = ((GzipCompressorInputStream) input).getMetaData().getFilename();
@@ -479,10 +540,14 @@ public final class ArchiveManager {
             if (target == null) {
                 return 0;
             }
+            String fileName = target.getAbsolutePath();
+            long totalBytes = gzipUncompressedSize(archive);
+            reportFileProgress(progressListener, fileName, 0, 0, totalBytes);
             ensureParent(target);
             try (OutputStream output = new BufferedOutputStream(new FileOutputStream(target))) {
-                copy(input, output);
+                copyWithProgress(input, output, progressListener, fileName, 0, totalBytes);
             }
+            reportFileProgress(progressListener, fileName, 1, totalBytes, totalBytes);
             return 1;
         }
     }
@@ -544,7 +609,8 @@ public final class ArchiveManager {
         }
     }
 
-    private static int extractZip(File archive, File destination, char[] password) throws Exception {
+    private static int extractZip(File archive, File destination, char[] password,
+            ProgressListener progressListener) throws Exception {
         int count = 0;
         try (ZipFile zip = password == null || password.length == 0
                 ? new ZipFile(archive)
@@ -557,19 +623,24 @@ public final class ArchiveManager {
                     }
                     continue;
                 }
+                long totalBytes = Math.max(0, header.getUncompressedSize());
+                reportFileProgress(progressListener, header.getFileName(), count, 0, totalBytes);
                 ensureParent(target);
                 try (InputStream input = zip.getInputStream(header);
                         OutputStream output = new BufferedOutputStream(new FileOutputStream(target))) {
-                    copy(input, output);
+                    copyWithProgress(input, output, progressListener, header.getFileName(),
+                        count, totalBytes);
                 }
                 count++;
+                reportFileProgress(progressListener, header.getFileName(), count,
+                    totalBytes, totalBytes);
             }
         }
         return count;
     }
 
-    private static int extractSevenZip(File archive, File destination, char[] password)
-            throws IOException {
+    private static int extractSevenZip(File archive, File destination, char[] password,
+            ProgressListener progressListener) throws IOException {
         int count = 0;
         try (SevenZFile sevenZ = password == null || password.length == 0
                 ? new SevenZFile(archive)
@@ -583,21 +654,30 @@ public final class ArchiveManager {
                     }
                     continue;
                 }
+                long totalBytes = Math.max(0, entry.getSize());
+                reportFileProgress(progressListener, entry.getName(), count, 0, totalBytes);
                 ensureParent(target);
+                long[] outputBytesWritten = { 0 };
                 try (OutputStream output = new BufferedOutputStream(new FileOutputStream(target))) {
                     byte[] buffer = new byte[BUFFER_SIZE];
                     int read;
                     while ((read = sevenZ.read(buffer)) != -1) {
                         output.write(buffer, 0, read);
+                    outputBytesWritten[0] += read;
+                        reportFileProgress(progressListener, entry.getName(), count,
+                            outputBytesWritten[0], totalBytes);
                     }
                 }
                 count++;
+                reportFileProgress(progressListener, entry.getName(), count,
+                    totalBytes, totalBytes);
             }
         }
         return count;
     }
 
-    private static int extractRar(File archive, File destination, char[] password) throws Exception {
+    private static int extractRar(File archive, File destination, char[] password,
+            ProgressListener progressListener) throws Exception {
         int count = 0;
         try (Archive rar = password == null || password.length == 0
                 ? new Archive(archive)
@@ -610,17 +690,41 @@ public final class ArchiveManager {
                     }
                     continue;
                 }
+                long totalBytes = Math.max(0, header.getFullUnpackSize());
+                reportFileProgress(progressListener, header.getFileName(), count, 0, totalBytes);
                 ensureParent(target);
-                try (OutputStream output = new BufferedOutputStream(new FileOutputStream(target))) {
+                long[] outputBytesWritten = { 0 };
+                int fileIndex = count;
+                try (OutputStream rawOutput = new BufferedOutputStream(new FileOutputStream(target));
+                        OutputStream output = new FilterOutputStream(rawOutput) {
+                            @Override
+                            public void write(int value) throws IOException {
+                                out.write(value);
+                                reportFileProgress(progressListener, header.getFileName(), fileIndex,
+                                    ++outputBytesWritten[0], totalBytes);
+                            }
+
+                            @Override
+                            public void write(byte[] buffer, int offset, int length)
+                                    throws IOException {
+                                out.write(buffer, offset, length);
+                                outputBytesWritten[0] += length;
+                                reportFileProgress(progressListener, header.getFileName(), fileIndex,
+                                        outputBytesWritten[0], totalBytes);
+                            }
+                        }) {
                     rar.extractFile(header, output);
                 }
                 count++;
+                reportFileProgress(progressListener, header.getFileName(), count,
+                        totalBytes, totalBytes);
             }
         }
         return count;
     }
 
-    private static int extractTar(File archive, File destination, boolean gzip) throws IOException {
+    private static int extractTar(File archive, File destination, boolean gzip,
+            ProgressListener progressListener) throws IOException {
         int count = 0;
         try (TarArchiveInputStream tar = openTarInput(archive, gzip)) {
             TarArchiveEntry entry;
@@ -638,17 +742,45 @@ public final class ArchiveManager {
                 if (!entry.isFile()) {
                     continue;
                 }
+                long totalBytes = Math.max(0, entry.getSize());
+                reportFileProgress(progressListener, entry.getName(), count, 0, totalBytes);
                 ensureParent(target);
                 try (OutputStream output = new BufferedOutputStream(new FileOutputStream(target))) {
-                    copy(tar, output);
+                    copyWithProgress(tar, output, progressListener, entry.getName(),
+                            count, totalBytes);
                 }
                 count++;
+                reportFileProgress(progressListener, entry.getName(), count,
+                        totalBytes, totalBytes);
             }
         }
         return count;
     }
 
-    private static void extractGzip(File archive, File destination) throws IOException {
+    private static void reportFileProgress(ProgressListener progressListener,
+            String fileName, int completedFiles, long bytesCopied, long totalBytes) {
+        if (progressListener != null) {
+            progressListener.onFileProgress(fileName, completedFiles, bytesCopied, totalBytes);
+        }
+    }
+
+    private static long gzipUncompressedSize(File archive) {
+        try (RandomAccessFile input = new RandomAccessFile(archive, "r")) {
+            if (input.length() < 4) {
+                return 0;
+            }
+            input.seek(input.length() - 4);
+            return input.readUnsignedByte()
+                    | ((long) input.readUnsignedByte() << 8)
+                    | ((long) input.readUnsignedByte() << 16)
+                    | ((long) input.readUnsignedByte() << 24);
+        } catch (IOException ignored) {
+            return 0;
+        }
+    }
+
+    private static void extractGzip(File archive, File destination,
+            ProgressListener progressListener) throws IOException {
         try (InputStream input = new GzipCompressorInputStream(
                 new BufferedInputStream(new FileInputStream(archive)), true)) {
             String storedName = ((GzipCompressorInputStream) input).getMetaData().getFilename();
@@ -656,10 +788,13 @@ public final class ArchiveManager {
                     ? removeArchiveExtension(archive)
                     : storedName;
             File target = safeTarget(destination, outputName);
+            long totalBytes = gzipUncompressedSize(archive);
+            reportFileProgress(progressListener, outputName, 0, 0, totalBytes);
             ensureParent(target);
             try (OutputStream output = new BufferedOutputStream(new FileOutputStream(target))) {
-                copy(input, output);
+                copyWithProgress(input, output, progressListener, outputName, 0, totalBytes);
             }
+            reportFileProgress(progressListener, outputName, 1, totalBytes, totalBytes);
         }
     }
 
@@ -823,6 +958,21 @@ public final class ArchiveManager {
         int read;
         while ((read = input.read(buffer)) != -1) {
             output.write(buffer, 0, read);
+        }
+    }
+
+    private static void copyWithProgress(InputStream input, OutputStream output,
+            ProgressListener progressListener, String fileName, int completedFiles,
+            long totalBytes) throws IOException {
+        byte[] buffer = new byte[BUFFER_SIZE];
+        long bytesCopied = 0;
+        int read;
+        while ((read = input.read(buffer)) != -1) {
+            output.write(buffer, 0, read);
+            bytesCopied += read;
+            long reportedTotal = totalBytes > 0 && bytesCopied > totalBytes ? 0 : totalBytes;
+            reportFileProgress(progressListener, fileName, completedFiles,
+                    bytesCopied, reportedTotal);
         }
     }
 

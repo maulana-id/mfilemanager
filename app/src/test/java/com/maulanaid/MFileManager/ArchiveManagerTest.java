@@ -59,7 +59,22 @@ public class ArchiveManagerTest {
             assertTrue(result.archiveBytes > 0);
 
             File extraction = new File(workDirectory, "extract-" + format.name());
-            ArchiveManager.extract(archive, extraction, null);
+            int[] reportedProgress = { 0 };
+            String[] currentFile = { null };
+            long[] reportedBytes = { 0 };
+            long[] reportedTotalBytes = { 0 };
+            int extractedFiles = ArchiveManager.extract(archive, extraction, null,
+                    (fileName, completed, bytesCopied, totalBytes) -> {
+                        currentFile[0] = fileName;
+                        reportedProgress[0] = completed;
+                        reportedBytes[0] = bytesCopied;
+                        reportedTotalBytes[0] = totalBytes;
+                    });
+            assertEquals(1, extractedFiles);
+            assertEquals(extractedFiles, reportedProgress[0]);
+            assertTrue(currentFile[0] != null && !currentFile[0].isEmpty());
+            assertEquals(sourceFile.length(), reportedBytes[0]);
+            assertEquals(sourceFile.length(), reportedTotalBytes[0]);
             File extractedFile = format == ArchiveManager.Format.GZIP
                     ? new File(extraction, sourceFile.getName())
                     : new File(extraction, "source/nested/sample.txt");
@@ -121,8 +136,16 @@ public class ArchiveManagerTest {
 
             File fileDestination = new File(workDirectory, "selected-file-" + format.name());
             assertTrue(fileDestination.mkdir());
+                long[] selectedBytes = { 0 };
+                long[] selectedTotalBytes = { 0 };
             assertEquals(1, ArchiveManager.extractEntries(archive,
-                    Arrays.asList("source/nested/sample.txt"), fileDestination, null));
+                    Arrays.asList("source/nested/sample.txt"), fileDestination, null,
+                    (fileName, completedFiles, bytesCopied, totalBytes) -> {
+                    selectedBytes[0] = bytesCopied;
+                    selectedTotalBytes[0] = totalBytes;
+                    }));
+                assertEquals(sourceFile.length(), selectedBytes[0]);
+                assertEquals(sourceFile.length(), selectedTotalBytes[0]);
             assertTrue(new File(fileDestination, "sample.txt").isFile());
             assertFalse(new File(fileDestination, "unrelated.txt").exists());
             assertFalse(new File(fileDestination, "nested").exists());
