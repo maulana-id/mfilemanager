@@ -19,6 +19,7 @@
 package com.maulanaid.MFileManager;
 
 import android.Manifest;
+import android.app.ActivityManager;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
@@ -341,6 +342,7 @@ public class MainActivity extends AppCompatActivity {
                     ContextCompat.RECEIVER_NOT_EXPORTED);
             shareStatusReceiverRegistered = true;
         }
+        reconcileShareState();
         updateHttpShareStatus();
     }
 
@@ -3306,6 +3308,35 @@ public class MainActivity extends AppCompatActivity {
         }
         httpShareStatus.setText(status.toString());
         copyHttpShareUrlButton.setVisibility(View.VISIBLE);
+    }
+
+    private void reconcileShareState() {
+        boolean httpRunning = isServiceRunning(HttpShareService.class);
+        boolean ftpRunning = isServiceRunning(FtpShareService.class);
+        SharedPreferences.Editor editor = preferences.edit();
+        if (!httpRunning) {
+            editor.putBoolean(PREF_HTTP_ACTIVE, false)
+                    .remove(PREF_HTTP_PATH)
+                    .remove(PREF_HTTP_URLS);
+        }
+        if (!ftpRunning) {
+            editor.putBoolean(PREF_FTP_ACTIVE, false)
+                    .remove(PREF_FTP_PATH)
+                    .remove(PREF_FTP_URLS);
+        }
+        editor.apply();
+    }
+
+    private boolean isServiceRunning(Class<?> serviceClass) {
+        ActivityManager activityManager = (ActivityManager) getSystemService(ACTIVITY_SERVICE);
+        for (ActivityManager.RunningServiceInfo service
+                : activityManager.getRunningServices(Integer.MAX_VALUE)) {
+            if (service.service != null
+                    && serviceClass.getName().equals(service.service.getClassName())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void copyHttpShareUrl() {
