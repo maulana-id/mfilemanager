@@ -23,7 +23,8 @@ A simple Android file manager for browsing shared storage and performing basic f
 - Switch between VS Code-inspired light and dark color themes.
 - Request storage access according to the Android version.
 - Browse user-granted restricted folders through Android's Storage Access Framework.
-- Detect Shizuku availability and permission, and provide a wireless-debugging settings guide.
+- Detect Shizuku availability and automatically open `Android/data` or `Android/obb` folders through elevated shell access after permission is granted.
+- Provide a wireless-debugging settings guide.
 
 ## First-Run Acknowledgement
 
@@ -218,7 +219,7 @@ The app's storage permission is sensitive. Google Play distribution may require 
 
 Use **Settings → Grant restricted folder access** to select `Android/data`, `Android/obb`, or another folder with Android's document picker. The persisted grant is exposed through **Settings → Browse restricted folder**. Folder navigation and file-opening actions use Storage Access Framework; copy, rename, and delete operations inside the existing main file list are not added to SAF-only grants.
 
-**Settings → Shizuku restricted access** reports whether the Shizuku binder is running and whether the app has permission. It does not start Shizuku or grant elevated shell access automatically.
+**Settings → Shizuku restricted access** reports whether the Shizuku binder is running and whether the app has permission. Clicking an `Android/data` or `Android/obb` folder automatically requests Shizuku permission when needed, then opens that folder through an elevated shell browser. Selecting a file copies it to the app cache before opening it with another app. Shizuku does not grant storage permissions to the app's Android UID or automatically change normal file-manager operations.
 
 Wireless debugging is available as a developer-settings guide only. MFIle Manager does not connect to localhost ADB ports or reuse pairing credentials, since pairing and ADB authorization must remain under the user's control.
 

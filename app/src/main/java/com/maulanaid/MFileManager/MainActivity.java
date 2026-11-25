@@ -39,6 +39,7 @@ import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.os.ParcelFileDescriptor;
 import android.provider.Settings;
 import android.provider.DocumentsContract;
 import android.text.Editable;
@@ -80,6 +81,7 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Calendar;
@@ -99,6 +101,10 @@ import java.util.concurrent.Executors;
 import android.webkit.MimeTypeMap;
 import androidx.documentfile.provider.DocumentFile;
 import rikka.shizuku.Shizuku;
+import moe.shizuku.server.IShizukuService;
+import moe.shizuku.server.IRemoteProcess;
+import java.lang.reflect.Method;
+import java.nio.charset.StandardCharsets;
 
 public class MainActivity extends AppCompatActivity {
     private static final int PERMISSION_REQUEST_CODE = 100;
@@ -186,6 +192,7 @@ public class MainActivity extends AppCompatActivity {
     private DocumentFile restrictedFolderRoot;
     private DocumentFile restrictedFolderDirectory;
     private final List<DocumentFile> restrictedFolderStack = new ArrayList<>();
+    private File pendingShizukuRestrictedFolder;
     private String grouping = GROUP_NONE;
     private String sorting = SORT_NAME;
     private String searchQuery = "";
@@ -206,9 +213,17 @@ public class MainActivity extends AppCompatActivity {
     private final Shizuku.OnRequestPermissionResultListener shizukuPermissionListener =
             (requestCode, grantResult) -> {
                 if (requestCode == SHIZUKU_PERMISSION_REQUEST_CODE) {
-                    toast(grantResult == PackageManager.PERMISSION_GRANTED
-                            ? "Shizuku access granted"
-                            : "Shizuku access was denied");
+                    if (grantResult == PackageManager.PERMISSION_GRANTED) {
+                        toast("Shizuku access granted");
+                        File pending = pendingShizukuRestrictedFolder;
+                        pendingShizukuRestrictedFolder = null;
+                        if (pending != null) {
+                            showShizukuRestrictedFolder(pending);
+                        }
+                    } else {
+                        pendingShizukuRestrictedFolder = null;
+                        toast("Shizuku access was denied");
+                    }
                 }
             };
     private final BroadcastReceiver shareStatusReceiver = new BroadcastReceiver() {
@@ -449,6 +464,10 @@ public class MainActivity extends AppCompatActivity {
         }
         if (clickedFile.isDirectory()) {
             lastClickedDirectory = clickedFile;
+            if (isRestrictedAndroidDataFolder(clickedFile)) {
+                openRestrictedFolderAutomatically(clickedFile);
+                return;
+            }
             if (treeViewEnabled && !StorageHelper.isStorageRoot(currentDirectory)) {
                 toggleExpandedFolder(clickedFile);
             } else {
@@ -527,9 +546,14 @@ public class MainActivity extends AppCompatActivity {
             if (resultCode == RESULT_OK && data != null && data.getData() != null) {
                 Uri uri = data.getData();
                 try {
-                    final int takeFlags = data.getFlags()
-                            & (Intent.FLAG_GRANT_READ_URI_PERMISSION
-                            | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                    final int returnedFlags = data.getFlags();
+                    int takeFlags = 0;
+                    if ((returnedFlags & Intent.FLAG_GRANT_READ_URI_PERMISSION) != 0) {
+                        takeFlags |= Intent.FLAG_GRANT_READ_URI_PERMISSION;
+                    }
+                    if ((returnedFlags & Intent.FLAG_GRANT_WRITE_URI_PERMISSION) != 0) {
+                        takeFlags |= Intent.FLAG_GRANT_WRITE_URI_PERMISSION;
+                    }
                     getContentResolver().takePersistableUriPermission(uri, takeFlags);
                     preferences.edit().putString(PREF_RESTRICTED_FOLDER_URI, uri.toString()).apply();
                     restrictedFolderRoot = DocumentFile.fromTreeUri(this, uri);
@@ -902,6 +926,197 @@ public class MainActivity extends AppCompatActivity {
                     }
                 })
                 .show();
+    }
+
+    private static final class ShizukuEntry {
+        final String path;
+        final String name;
+        final boolean directory;
+
+        ShizukuEntry(String path, String name, boolean directory) {
+            this.path = path;
+            this.name = name;
+            this.directory = directory;
+        }
+    }
+
+    private final List<String> shizukuFolderStack = new ArrayList<>();
+
+    private boolean isRestrictedAndroidDataFolder(File folder) {
+        if (folder == null) {
+            return false;
+        }
+        String path = folder.getAbsolutePath();
+        return path.contains("/Android/data")
+                || path.contains("/Android/obb");
+    }
+
+    private boolean hasShizukuAccess() {
+        try {
+            return Shizuku.pingBinder()
+                    && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED;
+        } catch (RuntimeException exception) {
+            return false;
+        }
+    }
+
+    private void openRestrictedFolderAutomatically(File folder) {
+        if (!hasShizukuAccess()) {
+            try {
+                if (!Shizuku.pingBinder()) {
+                    toast("Shizuku is not running");
+                    showShizukuAccessDialog();
+                    return;
+                }
+            } catch (RuntimeException exception) {
+                toast("Shizuku is not running");
+                showShizukuAccessDialog();
+                return;
+            }
+            pendingShizukuRestrictedFolder = folder;
+            Shizuku.requestPermission(SHIZUKU_PERMISSION_REQUEST_CODE);
+            return;
+        }
+        shizukuFolderStack.clear();
+        showShizukuRestrictedFolder(folder);
+    }
+
+    private void showShizukuRestrictedFolder(File folder) {
+        toast("Loading with Shizuku...");
+        renderExecutor.execute(() -> {
+            try {
+                List<ShizukuEntry> entries = listShizukuFolder(folder.getAbsolutePath());
+                mainHandler.post(() -> showShizukuFolderDialog(folder.getAbsolutePath(), entries));
+            } catch (Exception exception) {
+                mainHandler.post(() -> toast("Could not read folder with Shizuku"));
+            }
+        });
+    }
+
+    private List<ShizukuEntry> listShizukuFolder(String directory) throws Exception {
+        String findCommand = "find " + shellQuote(directory)
+                + " -mindepth 1 -maxdepth 1 -print0";
+        byte[] output = runShizukuCommand(findCommand, true);
+        List<ShizukuEntry> entries = new ArrayList<>();
+        int start = 0;
+        for (int index = 0; index <= output.length; index++) {
+            if (index == output.length || output[index] == 0) {
+                if (start < index) {
+                    String path = new String(output, start, index - start, StandardCharsets.UTF_8);
+                    int slash = path.lastIndexOf('/');
+                    String name = slash >= 0 ? path.substring(slash + 1) : path;
+                    boolean isDirectory = isShizukuDirectory(path);
+                    entries.add(new ShizukuEntry(path, name, isDirectory));
+                }
+                start = index + 1;
+            }
+        }
+        entries.sort((left, right) -> {
+            if (left.directory != right.directory) {
+                return left.directory ? -1 : 1;
+            }
+            return left.name.compareToIgnoreCase(right.name);
+        });
+        return entries;
+    }
+
+    private boolean isShizukuDirectory(String path) throws Exception {
+        IRemoteProcess process = createShizukuProcess(
+                "test -d " + shellQuote(path));
+        try {
+            return process.waitFor() == 0;
+        } finally {
+            process.destroy();
+        }
+    }
+
+    private String shellQuote(String value) {
+        return "'" + value.replace("'", "'\"'\"'") + "'";
+    }
+
+    private IRemoteProcess createShizukuProcess(String command) throws Exception {
+        Method requireService = Shizuku.class.getDeclaredMethod("requireService");
+        requireService.setAccessible(true);
+        IShizukuService service = (IShizukuService) requireService.invoke(null);
+        return service.newProcess(
+                new String[] { "/system/bin/sh", "-c", command },
+                null,
+                "/");
+    }
+
+    private byte[] runShizukuCommand(String command, boolean readOutput) throws Exception {
+        IRemoteProcess process = createShizukuProcess(command);
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        try {
+            if (readOutput) {
+                ParcelFileDescriptor input = process.getInputStream();
+                if (input != null) {
+                    try (android.os.ParcelFileDescriptor.AutoCloseInputStream stream =
+                                 new android.os.ParcelFileDescriptor.AutoCloseInputStream(input)) {
+                        byte[] buffer = new byte[8192];
+                        int count;
+                        while ((count = stream.read(buffer)) != -1) {
+                            output.write(buffer, 0, count);
+                        }
+                    }
+                }
+            }
+            int status = process.waitFor();
+            if (status != 0) {
+                throw new IOException("Shizuku command failed");
+            }
+            return output.toByteArray();
+        } finally {
+            process.destroy();
+        }
+    }
+
+    private void showShizukuFolderDialog(String directory, List<ShizukuEntry> entries) {
+        List<String> labels = new ArrayList<>();
+        for (ShizukuEntry entry : entries) {
+            labels.add((entry.directory ? "[Folder] " : "[File] ") + entry.name);
+        }
+        if (labels.isEmpty()) {
+            labels.add("(empty folder)");
+        }
+
+        AlertDialog.Builder builder = new AlertDialog.Builder(this)
+                .setTitle(directory)
+                .setItems(labels.toArray(new String[0]), (dialog, which) -> {
+                    if (which >= entries.size()) {
+                        return;
+                    }
+                    ShizukuEntry entry = entries.get(which);
+                    if (entry.directory) {
+                        shizukuFolderStack.add(directory);
+                        showShizukuRestrictedFolder(new File(entry.path));
+                    } else {
+                        copyShizukuFileToCache(entry);
+                    }
+                })
+                .setPositiveButton("Close", null);
+        if (!shizukuFolderStack.isEmpty()) {
+            builder.setNegativeButton("Back", (dialog, which) -> {
+                String parent = shizukuFolderStack.remove(shizukuFolderStack.size() - 1);
+                showShizukuRestrictedFolder(new File(parent));
+            });
+        }
+        builder.show();
+    }
+
+    private void copyShizukuFileToCache(ShizukuEntry entry) {
+        toast("Copying with Shizuku...");
+        renderExecutor.execute(() -> {
+            File destination = new File(getCacheDir(),
+                    "shizuku-" + System.currentTimeMillis() + "-" + entry.name);
+            try {
+                runShizukuCommand("cp " + shellQuote(entry.path)
+                        + " " + shellQuote(destination.getAbsolutePath()), false);
+                mainHandler.post(() -> openFile(destination));
+            } catch (Exception exception) {
+                mainHandler.post(() -> toast("Could not copy restricted file"));
+            }
+        });
     }
 
     private void addSettingChoice(SubMenu menu, String title, String value,
