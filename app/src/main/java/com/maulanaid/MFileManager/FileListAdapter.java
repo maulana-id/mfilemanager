@@ -72,6 +72,7 @@ public final class FileListAdapter extends ListAdapter<FileListAdapter.Row, Recy
         final String title;
         final String details;
         final boolean selected;
+        final boolean focused;
         final int depth;
         final boolean isDirectory;
         final boolean isExpanded;
@@ -82,7 +83,7 @@ public final class FileListAdapter extends ListAdapter<FileListAdapter.Row, Recy
         final int customIcon;
         boolean archiveEntry;
 
-        private Row(File file, String title, String details, boolean selected,
+        private Row(File file, String title, String details, boolean selected, boolean focused,
                 int depth, boolean isDirectory, boolean isExpanded, boolean hasChildren,
                 boolean treeNode, boolean isStorageDevice, int storageUsagePercent,
                 int customIcon) {
@@ -90,6 +91,7 @@ public final class FileListAdapter extends ListAdapter<FileListAdapter.Row, Recy
             this.title = title;
             this.details = details;
             this.selected = selected;
+            this.focused = focused;
             this.depth = depth;
             this.isDirectory = isDirectory;
             this.isExpanded = isExpanded;
@@ -101,33 +103,33 @@ public final class FileListAdapter extends ListAdapter<FileListAdapter.Row, Recy
         }
 
         public static Row file(File file, String details, boolean selected) {
-            return new Row(file, null, details, selected, 0,
+            return new Row(file, null, details, selected, false, 0,
                     file != null && file.isDirectory(), false, false, false, false, 0, 0);
         }
 
-        public static Row treeNode(File file, String details, boolean selected,
+        public static Row treeNode(File file, String details, boolean selected, boolean focused,
                 int depth, boolean isDirectory, boolean isExpanded, boolean hasChildren) {
-            return new Row(file, null, details, selected, depth, isDirectory, isExpanded,
+            return new Row(file, null, details, selected, focused, depth, isDirectory, isExpanded,
                     hasChildren, true, false, 0, 0);
         }
 
         public static Row archiveNode(File file, String details, boolean selected,
             int depth, boolean isDirectory, boolean isExpanded, boolean hasChildren) {
-            Row row = treeNode(file, details, selected, depth,
+            Row row = treeNode(file, details, selected, false, depth,
                 isDirectory, isExpanded, hasChildren);
             row.archiveEntry = true;
             return row;
         }
 
         public static Row storageDevice(File file, String title, String details,
-                int usagePercent, int iconRes, boolean selected, int depth, boolean hasChildren,
-                boolean isExpanded, boolean treeNode) {
-            return new Row(file, title, details, selected, depth, true, isExpanded,
+                int usagePercent, int iconRes, boolean selected, boolean focused,
+                int depth, boolean hasChildren, boolean isExpanded, boolean treeNode) {
+            return new Row(file, title, details, selected, focused, depth, true, isExpanded,
                     hasChildren, treeNode, true, usagePercent, iconRes);
         }
 
         public static Row heading(String title) {
-            return new Row(null, title, null, false, 0, false, false, false, false, false, 0, 0);
+            return new Row(null, title, null, false, false, 0, false, false, false, false, false, 0, 0);
         }
 
         public boolean isHeading() {
@@ -146,6 +148,7 @@ public final class FileListAdapter extends ListAdapter<FileListAdapter.Row, Recy
         boolean contentsEqual(Row other) {
             return depth == other.depth
                     && selected == other.selected
+                    && focused == other.focused
                     && isDirectory == other.isDirectory
                     && isExpanded == other.isExpanded
                     && hasChildren == other.hasChildren
@@ -362,6 +365,7 @@ public final class FileListAdapter extends ListAdapter<FileListAdapter.Row, Recy
             boundKey = rowKey;
 
             itemView.setSelected(row.selected);
+            itemView.setActivated(row.focused);
             String displayName = row.title != null ? row.title : (row.file != null ? row.file.getName() : "");
             name.setText(displayName);
             details.setText(row.details);
@@ -586,7 +590,7 @@ public final class FileListAdapter extends ListAdapter<FileListAdapter.Row, Recy
     }
 
     private String thumbnailKey(File file) {
-        if (file == null || file.isDirectory()) {
+        if (file == null || file.isDirectory() || file instanceof ShizukuFile) {
             return null;
         }
         String extension = extension(file);

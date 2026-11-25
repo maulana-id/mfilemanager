@@ -1,7 +1,8 @@
 build
 .gradle
 .vscode
-local.properties
 screenshots/
 docs
 scripts
+*.local.md
+local.properties

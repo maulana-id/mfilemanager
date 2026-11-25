@@ -1,5 +1,17 @@
 <selector xmlns:android="http://schemas.android.com/apk/res/android">
     <item android:state_pressed="true" android:drawable="@color/vscode_list_hover" />
+    <item android:state_selected="true" android:state_activated="true">
+        <shape android:shape="rectangle">
+            <solid android:color="@color/vscode_selection" />
+            <stroke android:width="1.5dp" android:color="@color/vscode_accent" />
+        </shape>
+    </item>
     <item android:state_selected="true" android:drawable="@color/vscode_selection" />
+    <item android:state_activated="true">
+        <shape android:shape="rectangle">
+            <solid android:color="@color/vscode_focus_bg" />
+            <stroke android:width="1.5dp" android:color="@color/vscode_accent" />
+        </shape>
+    </item>
     <item android:drawable="@android:color/transparent" />
 </selector>

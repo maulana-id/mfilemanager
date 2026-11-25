@@ -39,7 +39,6 @@ import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
-import android.os.ParcelFileDescriptor;
 import android.provider.Settings;
 import android.provider.DocumentsContract;
 import android.text.Editable;
@@ -81,7 +80,6 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
-import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Calendar;
@@ -101,10 +99,6 @@ import java.util.concurrent.Executors;
 import android.webkit.MimeTypeMap;
 import androidx.documentfile.provider.DocumentFile;
 import rikka.shizuku.Shizuku;
-import moe.shizuku.server.IShizukuService;
-import moe.shizuku.server.IRemoteProcess;
-import java.lang.reflect.Method;
-import java.nio.charset.StandardCharsets;
 
 public class MainActivity extends AppCompatActivity {
     private static final int PERMISSION_REQUEST_CODE = 100;
@@ -193,6 +187,7 @@ public class MainActivity extends AppCompatActivity {
     private DocumentFile restrictedFolderDirectory;
     private final List<DocumentFile> restrictedFolderStack = new ArrayList<>();
     private File pendingShizukuRestrictedFolder;
+    private boolean pendingShizukuExpandInTree;
     private String grouping = GROUP_NONE;
     private String sorting = SORT_NAME;
     private String searchQuery = "";
@@ -216,12 +211,15 @@ public class MainActivity extends AppCompatActivity {
                     if (grantResult == PackageManager.PERMISSION_GRANTED) {
                         toast("Shizuku access granted");
                         File pending = pendingShizukuRestrictedFolder;
+                        boolean expandInTree = pendingShizukuExpandInTree;
                         pendingShizukuRestrictedFolder = null;
+                        pendingShizukuExpandInTree = false;
                         if (pending != null) {
-                            showShizukuRestrictedFolder(pending);
+                            openShizukuDirectoryInExplorer(pending, expandInTree);
                         }
                     } else {
                         pendingShizukuRestrictedFolder = null;
+                        pendingShizukuExpandInTree = false;
                         toast("Shizuku access was denied");
                     }
                 }
@@ -283,7 +281,9 @@ public class MainActivity extends AppCompatActivity {
             String savedPath = savedInstanceState.getString("current_directory");
             if (savedPath != null) {
                 File savedDirectory = new File(savedPath);
-                if (savedDirectory.isDirectory()) {
+                if (ShizukuFileHelper.isRestrictedAndroidDataFolder(savedDirectory)) {
+                    currentDirectory = ShizukuFile.directory(savedDirectory.getAbsolutePath());
+                } else if (savedDirectory.isDirectory()) {
                     currentDirectory = savedDirectory;
                 }
             }
@@ -458,22 +458,43 @@ public class MainActivity extends AppCompatActivity {
             }
             return;
         }
+        if (clickedFile instanceof ShizukuFile) {
+            if (clickedFile.isDirectory()) {
+                lastClickedDirectory = clickedFile;
+                if (treeViewEnabled && !StorageHelper.isStorageRoot(currentDirectory)) {
+                    toggleExpandedFolder(clickedFile);
+                } else {
+                    navigateToDirectory(clickedFile);
+                }
+            } else {
+                lastClickedDirectory = clickedFile.getParentFile();
+                if (ArchiveManager.isSupportedArchive(clickedFile)) {
+                    stageShizukuFileAndRun((ShizukuFile) clickedFile,
+                            staged -> loadArchiveBrowser(staged, new char[0]));
+                } else {
+                    openFile(clickedFile);
+                }
+            }
+            return;
+        }
         if (clickedFile.isFile() && ArchiveManager.isSupportedArchive(clickedFile)) {
             loadArchiveBrowser(clickedFile, new char[0]);
             return;
         }
         if (clickedFile.isDirectory()) {
             lastClickedDirectory = clickedFile;
-            if (isRestrictedAndroidDataFolder(clickedFile)) {
-                openRestrictedFolderAutomatically(clickedFile);
+            if (isRestrictedAndroidDataFolder(clickedFile) && !hasShizukuAccess()) {
+                boolean expandInTree = treeViewEnabled && !StorageHelper.isStorageRoot(currentDirectory);
+                openRestrictedFolderAutomatically(clickedFile, expandInTree);
                 return;
             }
             if (treeViewEnabled && !StorageHelper.isStorageRoot(currentDirectory)) {
                 toggleExpandedFolder(clickedFile);
             } else {
-                currentDirectory = clickedFile;
-                selectedFiles.clear();
-                showFiles();
+                File target = isRestrictedAndroidDataFolder(clickedFile)
+                        ? ShizukuFile.wrap(clickedFile, true)
+                        : clickedFile;
+                navigateToDirectory(target);
             }
         } else {
             lastClickedDirectory = clickedFile.getParentFile();
@@ -907,6 +928,11 @@ public class MainActivity extends AppCompatActivity {
         } else if (!granted) {
             builder.setPositiveButton("Request permission", (dialog, which) ->
                     Shizuku.requestPermission(SHIZUKU_PERMISSION_REQUEST_CODE));
+        } else {
+            builder.setPositiveButton("Browse Android/data", (dialog, which) -> {
+                File androidData = new File(homeDirectory, "Android/data");
+                openShizukuDirectoryInExplorer(androidData, false);
+            });
         }
         builder.show();
     }
@@ -928,195 +954,119 @@ public class MainActivity extends AppCompatActivity {
                 .show();
     }
 
-    private static final class ShizukuEntry {
-        final String path;
-        final String name;
-        final boolean directory;
-
-        ShizukuEntry(String path, String name, boolean directory) {
-            this.path = path;
-            this.name = name;
-            this.directory = directory;
-        }
-    }
-
-    private final List<String> shizukuFolderStack = new ArrayList<>();
-
     private boolean isRestrictedAndroidDataFolder(File folder) {
-        if (folder == null) {
-            return false;
-        }
-        String path = folder.getAbsolutePath();
-        return path.contains("/Android/data")
-                || path.contains("/Android/obb");
+        return ShizukuFileHelper.isRestrictedAndroidDataFolder(folder);
     }
 
     private boolean hasShizukuAccess() {
-        try {
-            return Shizuku.pingBinder()
-                    && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED;
-        } catch (RuntimeException exception) {
-            return false;
-        }
+        return ShizukuFileHelper.hasShizukuAccess();
     }
 
-    private void openRestrictedFolderAutomatically(File folder) {
+    private void openRestrictedFolderAutomatically(File folder, boolean expandInTree) {
         if (!hasShizukuAccess()) {
-            try {
-                if (!Shizuku.pingBinder()) {
-                    toast("Shizuku is not running");
-                    showShizukuAccessDialog();
-                    return;
-                }
-            } catch (RuntimeException exception) {
+            if (!ShizukuFileHelper.isBinderReady()) {
                 toast("Shizuku is not running");
                 showShizukuAccessDialog();
                 return;
             }
             pendingShizukuRestrictedFolder = folder;
+            pendingShizukuExpandInTree = expandInTree;
             Shizuku.requestPermission(SHIZUKU_PERMISSION_REQUEST_CODE);
             return;
         }
-        shizukuFolderStack.clear();
-        showShizukuRestrictedFolder(folder);
+        openShizukuDirectoryInExplorer(folder, expandInTree);
     }
 
-    private void showShizukuRestrictedFolder(File folder) {
-        toast("Loading with Shizuku...");
-        renderExecutor.execute(() -> {
-            try {
-                List<ShizukuEntry> entries = listShizukuFolder(folder.getAbsolutePath());
-                mainHandler.post(() -> showShizukuFolderDialog(folder.getAbsolutePath(), entries));
-            } catch (Exception exception) {
-                mainHandler.post(() -> toast("Could not read folder with Shizuku"));
+    private void openShizukuDirectoryInExplorer(File folder, boolean expandInTree) {
+        ShizukuFile shizukuDir = ShizukuFile.wrap(folder, true);
+        if (expandInTree) {
+            String path = shizukuDir.getAbsolutePath();
+            if (!expandedPaths.contains(path)) {
+                expandedPaths.add(path);
+                expansionStack.remove(shizukuDir);
+                expansionStack.add(shizukuDir);
             }
-        });
-    }
-
-    private List<ShizukuEntry> listShizukuFolder(String directory) throws Exception {
-        String findCommand = "find " + shellQuote(directory)
-                + " -mindepth 1 -maxdepth 1 -print0";
-        byte[] output = runShizukuCommand(findCommand, true);
-        List<ShizukuEntry> entries = new ArrayList<>();
-        int start = 0;
-        for (int index = 0; index <= output.length; index++) {
-            if (index == output.length || output[index] == 0) {
-                if (start < index) {
-                    String path = new String(output, start, index - start, StandardCharsets.UTF_8);
-                    int slash = path.lastIndexOf('/');
-                    String name = slash >= 0 ? path.substring(slash + 1) : path;
-                    boolean isDirectory = isShizukuDirectory(path);
-                    entries.add(new ShizukuEntry(path, name, isDirectory));
-                }
-                start = index + 1;
-            }
-        }
-        entries.sort((left, right) -> {
-            if (left.directory != right.directory) {
-                return left.directory ? -1 : 1;
-            }
-            return left.name.compareToIgnoreCase(right.name);
-        });
-        return entries;
-    }
-
-    private boolean isShizukuDirectory(String path) throws Exception {
-        IRemoteProcess process = createShizukuProcess(
-                "test -d " + shellQuote(path));
-        try {
-            return process.waitFor() == 0;
-        } finally {
-            process.destroy();
+            lastClickedDirectory = shizukuDir;
+            renderFiles();
+        } else {
+            navigateToDirectory(shizukuDir);
         }
     }
 
-    private String shellQuote(String value) {
-        return "'" + value.replace("'", "'\"'\"'") + "'";
+    private void navigateToDirectory(File directory) {
+        leaveArchiveBrowser();
+        currentDirectory = directory;
+        lastClickedDirectory = null;
+        selectedFiles.clear();
+        pendingFocusDirectory = null;
+        searchInput.setText("");
+        showFiles();
+        scrollToTop();
     }
 
-    private IRemoteProcess createShizukuProcess(String command) throws Exception {
-        Method requireService = Shizuku.class.getDeclaredMethod("requireService");
-        requireService.setAccessible(true);
-        IShizukuService service = (IShizukuService) requireService.invoke(null);
-        return service.newProcess(
-                new String[] { "/system/bin/sh", "-c", command },
-                null,
-                "/");
+    private File getActiveFocusedDirectory() {
+        if (!treeViewEnabled || archiveBrowserFile != null || lastClickedDirectory == null) {
+            return null;
+        }
+        if (lastClickedDirectory.equals(currentDirectory)) {
+            return null;
+        }
+        String focusedPath = lastClickedDirectory.getAbsolutePath();
+        if (!expandedPaths.contains(focusedPath)) {
+            return null;
+        }
+        if (!StorageHelper.isStorageRoot(currentDirectory)
+                && !isAncestorOrSamePath(currentDirectory.getAbsolutePath(), focusedPath)) {
+            return null;
+        }
+        return lastClickedDirectory;
     }
 
-    private byte[] runShizukuCommand(String command, boolean readOutput) throws Exception {
-        IRemoteProcess process = createShizukuProcess(command);
-        ByteArrayOutputStream output = new ByteArrayOutputStream();
-        try {
-            if (readOutput) {
-                ParcelFileDescriptor input = process.getInputStream();
-                if (input != null) {
-                    try (android.os.ParcelFileDescriptor.AutoCloseInputStream stream =
-                                 new android.os.ParcelFileDescriptor.AutoCloseInputStream(input)) {
-                        byte[] buffer = new byte[8192];
-                        int count;
-                        while ((count = stream.read(buffer)) != -1) {
-                            output.write(buffer, 0, count);
-                        }
-                    }
-                }
-            }
-            int status = process.waitFor();
-            if (status != 0) {
-                throw new IOException("Shizuku command failed");
-            }
-            return output.toByteArray();
-        } finally {
-            process.destroy();
+    private static boolean isAncestorOrSamePath(String ancestorPath, String targetPath) {
+        if (ancestorPath == null || targetPath == null) {
+            return false;
+        }
+        if (ancestorPath.equals(targetPath)) {
+            return true;
+        }
+        if ("/".equals(ancestorPath)) {
+            return targetPath.startsWith("/");
+        }
+        return targetPath.startsWith(ancestorPath + "/");
+    }
+
+    private void updateSearchHint(File focusedDir) {
+        if (searchInput == null) {
+            return;
+        }
+        String hint;
+        if (archiveBrowserFile != null) {
+            hint = "Search inside " + archiveBrowserFile.getName();
+        } else if (focusedDir != null) {
+            String name = focusedDir.getName();
+            hint = name.isEmpty() ? "Search files and folders" : "Search in " + name;
+        } else if (StorageHelper.isStorageRoot(currentDirectory)) {
+            hint = "Search storage devices";
+        } else {
+            String name = currentDirectory.getName();
+            hint = name.isEmpty() ? "Search files and folders" : "Search in " + name;
+        }
+        if (!hint.contentEquals(searchInput.getHint())) {
+            searchInput.setHint(hint);
         }
     }
 
-    private void showShizukuFolderDialog(String directory, List<ShizukuEntry> entries) {
-        List<String> labels = new ArrayList<>();
-        for (ShizukuEntry entry : entries) {
-            labels.add((entry.directory ? "[Folder] " : "[File] ") + entry.name);
-        }
-        if (labels.isEmpty()) {
-            labels.add("(empty folder)");
-        }
-
-        AlertDialog.Builder builder = new AlertDialog.Builder(this)
-                .setTitle(directory)
-                .setItems(labels.toArray(new String[0]), (dialog, which) -> {
-                    if (which >= entries.size()) {
-                        return;
-                    }
-                    ShizukuEntry entry = entries.get(which);
-                    if (entry.directory) {
-                        shizukuFolderStack.add(directory);
-                        showShizukuRestrictedFolder(new File(entry.path));
-                    } else {
-                        copyShizukuFileToCache(entry);
-                    }
-                })
-                .setPositiveButton("Close", null);
-        if (!shizukuFolderStack.isEmpty()) {
-            builder.setNegativeButton("Back", (dialog, which) -> {
-                String parent = shizukuFolderStack.remove(shizukuFolderStack.size() - 1);
-                showShizukuRestrictedFolder(new File(parent));
-            });
-        }
-        builder.show();
+    private interface StagedFileCallback {
+        void onStaged(File stagedFile);
     }
 
-    private void copyShizukuFileToCache(ShizukuEntry entry) {
-        toast("Copying with Shizuku...");
-        renderExecutor.execute(() -> {
-            File destination = new File(getCacheDir(),
-                    "shizuku-" + System.currentTimeMillis() + "-" + entry.name);
-            try {
-                runShizukuCommand("cp " + shellQuote(entry.path)
-                        + " " + shellQuote(destination.getAbsolutePath()), false);
-                mainHandler.post(() -> openFile(destination));
-            } catch (Exception exception) {
-                mainHandler.post(() -> toast("Could not copy restricted file"));
-            }
-        });
+    private void stageShizukuFileAndRun(ShizukuFile remoteFile, StagedFileCallback callback) {
+        runArchiveOperation("Reading " + remoteFile.getName(), progress -> {
+            File staged = ShizukuFileHelper.stageToCache(MainActivity.this, remoteFile,
+                    progress::update);
+            mainHandler.post(() -> callback.onStaged(staged));
+            return null;
+        }, false, false, null);
     }
 
     private void addSettingChoice(SubMenu menu, String title, String value,
@@ -1158,9 +1108,13 @@ public class MainActivity extends AppCompatActivity {
         }
         if (selectedFiles.size() == 1 && pressedFile.isDirectory()) {
             actions.add(new ActionItem("Browse into this folder", R.drawable.ic_action_open, () -> {
-                currentDirectory = pressedFile;
-                selectedFiles.clear();
-                showFiles();
+                if (isRestrictedAndroidDataFolder(pressedFile) && !hasShizukuAccess()) {
+                    openRestrictedFolderAutomatically(pressedFile, false);
+                    return;
+                }
+                File target = ShizukuFileHelper.isShizukuTarget(pressedFile)
+                        ? ShizukuFile.wrap(pressedFile, true) : pressedFile;
+                navigateToDirectory(target);
             }));
             if (treeViewEnabled) {
                 boolean isExpanded = expandedPaths.contains(pressedFile.getAbsolutePath());
@@ -1192,24 +1146,38 @@ public class MainActivity extends AppCompatActivity {
                     () -> showPropertiesDialog(pressedFile)));
         }
         if (selectedFiles.size() == 1 && ArchiveManager.isSupportedArchive(pressedFile)) {
-            actions.add(new ActionItem("Browse archive", R.drawable.ic_file_archive,
-                    () -> loadArchiveBrowser(pressedFile, new char[0])));
-            actions.add(new ActionItem("Extract archive...", R.drawable.ic_file_archive,
-                    () -> showArchivePasswordDialog(pressedFile, true)));
+            actions.add(new ActionItem("Browse archive", R.drawable.ic_file_archive, () -> {
+                if (pressedFile instanceof ShizukuFile) {
+                    stageShizukuFileAndRun((ShizukuFile) pressedFile,
+                            staged -> loadArchiveBrowser(staged, new char[0]));
+                } else {
+                    loadArchiveBrowser(pressedFile, new char[0]);
+                }
+            }));
+            actions.add(new ActionItem("Extract archive...", R.drawable.ic_file_archive, () -> {
+                if (pressedFile instanceof ShizukuFile) {
+                    stageShizukuFileAndRun((ShizukuFile) pressedFile,
+                            staged -> showArchivePasswordDialog(staged, true));
+                } else {
+                    showArchivePasswordDialog(pressedFile, true);
+                }
+            }));
         }
         if (!selectedFiles.isEmpty()) {
             actions.add(new ActionItem("Compress " + selectedFiles.size() + " item(s)...",
                     R.drawable.ic_file_archive, this::showArchiveFormatChooser));
         }
-        actions.add(new ActionItem("Share this file/folder over HTTP",
-                R.drawable.ic_action_share, () -> requestHttpShare(pressedFile)));
-        if (pressedFile.isDirectory()) {
-            boolean ftpReadonly = preferences.getBoolean(PREF_FTP_READONLY, false);
-            String ftpLabel = ftpReadonly
-                    ? "Share folder over FTP (read-only)"
-                    : "Share folder over FTP (full access)";
-            actions.add(new ActionItem(ftpLabel,
-                    R.drawable.ic_action_share, () -> requestFtpShare(pressedFile)));
+        if (!ShizukuFileHelper.isShizukuTarget(pressedFile)) {
+            actions.add(new ActionItem("Share this file/folder over HTTP",
+                    R.drawable.ic_action_share, () -> requestHttpShare(pressedFile)));
+            if (pressedFile.isDirectory()) {
+                boolean ftpReadonly = preferences.getBoolean(PREF_FTP_READONLY, false);
+                String ftpLabel = ftpReadonly
+                        ? "Share folder over FTP (read-only)"
+                        : "Share folder over FTP (full access)";
+                actions.add(new ActionItem(ftpLabel,
+                        R.drawable.ic_action_share, () -> requestFtpShare(pressedFile)));
+            }
         }
         actions.add(new ActionItem("Copy " + selectedFiles.size() + " item(s)",
                 R.drawable.ic_action_copy, this::copySelected));
@@ -1281,6 +1249,10 @@ public class MainActivity extends AppCompatActivity {
             toggleExpandedArchiveEntry(((ArchiveEntryFile) folder).node);
             return;
         }
+        if (ShizukuFileHelper.isShizukuTarget(folder) && !hasShizukuAccess()) {
+            openRestrictedFolderAutomatically(folder, true);
+            return;
+        }
         String path = folder.getAbsolutePath();
         if (expandedPaths.contains(path)) {
             expandedPaths.remove(path);
@@ -1338,6 +1310,9 @@ public class MainActivity extends AppCompatActivity {
         final Set<String> expanded = new LinkedHashSet<>(expandedPaths);
         final Set<File> selected = new LinkedHashSet<>(selectedFiles);
         final Set<String> archiveExpanded = new LinkedHashSet<>(expandedArchivePaths);
+        final File focusedDir = getActiveFocusedDirectory();
+        updateSearchHint(focusedDir);
+        final boolean shizukuReady = hasShizukuAccess();
         final Comparator<File> cmp = fileComparator();
         final SimpleDateFormat dateFmt = new SimpleDateFormat("MMM d", Locale.getDefault());
 
@@ -1356,6 +1331,7 @@ public class MainActivity extends AppCompatActivity {
 
             // Per-pass cache: directory path → its children array
             Map<String, File[]> dirCache = new HashMap<>();
+            boolean[] shizukuError = { false };
 
             List<FileListAdapter.Row> rows = new ArrayList<>();
             List<File> rowFilesList = new ArrayList<>();
@@ -1366,32 +1342,44 @@ public class MainActivity extends AppCompatActivity {
             } else if (StorageHelper.isStorageRoot(dir)) {
                 List<StorageHelper.StorageDevice> devices = StorageHelper.getStorageDevices(MainActivity.this);
                 for (StorageHelper.StorageDevice dev : devices) {
-                    if (!query.isEmpty()
+                    boolean matchesFocusPath = focusedDir != null
+                            && isAncestorOrSamePath(dev.file.getAbsolutePath(),
+                                    focusedDir.getAbsolutePath());
+                    if (!query.isEmpty() && focusedDir != null && !matchesFocusPath) {
+                        continue;
+                    }
+                    if (!query.isEmpty() && focusedDir == null
                             && !dev.label.toLowerCase(Locale.ROOT).contains(query)
                             && !dev.file.getName().toLowerCase(Locale.ROOT).contains(query)) {
                         continue;
                     }
                     boolean isExpanded = treeView && expanded.contains(dev.file.getAbsolutePath());
-                    File[] children = cachedListFiles(dev.file, dirCache);
+                    boolean isFocused = focusedDir != null
+                            && dev.file.getAbsolutePath().equals(focusedDir.getAbsolutePath());
+                    File[] children = listDirectoryChildren(dev.file, dirCache, false,
+                            shizukuReady, null);
                     boolean hasChildren = children != null && children.length > 0;
 
                     rows.add(FileListAdapter.Row.storageDevice(
                             dev.file, dev.label, dev.getFormattedDetails(),
-                            dev.usedPercent, dev.iconRes, selected.contains(dev.file),
+                            dev.usedPercent, dev.iconRes, selected.contains(dev.file), isFocused,
                             0, hasChildren, isExpanded, treeView));
                     rowFilesList.add(dev.file);
 
                     if (treeView && isExpanded) {
-                        buildTreeRows(dev.file, 1, query, expanded, selected, cmp, rows, rowFilesList,
-                                dirCache, dateFmt, showHidden);
+                        buildTreeRows(dev.file, 1, query, expanded, selected, focusedDir, cmp,
+                                rows, rowFilesList, dirCache, dateFmt, showHidden,
+                                shizukuReady, shizukuError);
                     }
                 }
             } else if (treeView) {
-                buildTreeRows(dir, 0, query, expanded, selected, cmp, rows, rowFilesList,
-                        dirCache, dateFmt, showHidden);
+                buildTreeRows(dir, 0, query, expanded, selected, focusedDir, cmp,
+                        rows, rowFilesList, dirCache, dateFmt, showHidden,
+                        shizukuReady, shizukuError);
             } else {
                 List<File> filtered = new ArrayList<>();
-                File[] children = dir.listFiles();
+                File[] children = listDirectoryChildren(dir, dirCache, true,
+                        shizukuReady, shizukuError);
                 if (children != null) {
                     for (File f : children) {
                         if (!showHidden && f.getName().startsWith(".")) {
@@ -1416,7 +1404,7 @@ public class MainActivity extends AppCompatActivity {
                     for (Map.Entry<String, List<File>> e : groups.entrySet()) {
                         e.getValue().sort(cmp);
                         buildFlatRows(e.getKey(), e.getValue(), selected,
-                                rows, rowFilesList, dirCache, dateFmt);
+                                rows, rowFilesList, dirCache, dateFmt, shizukuReady);
                     }
                 } else if (GROUP_DATE.equals(grp)) {
                     Map<Long, List<File>> groups = new TreeMap<>(Collections.reverseOrder());
@@ -1427,10 +1415,11 @@ public class MainActivity extends AppCompatActivity {
                     for (Map.Entry<Long, List<File>> e : groups.entrySet()) {
                         e.getValue().sort(cmp);
                         buildFlatRows(dateGroupName(e.getKey()), e.getValue(), selected,
-                                rows, rowFilesList, dirCache, dateFmt);
+                                rows, rowFilesList, dirCache, dateFmt, shizukuReady);
                     }
                 } else {
-                    buildFlatRows(null, filtered, selected, rows, rowFilesList, dirCache, dateFmt);
+                    buildFlatRows(null, filtered, selected, rows, rowFilesList,
+                            dirCache, dateFmt, shizukuReady);
                 }
             }
 
@@ -1440,6 +1429,9 @@ public class MainActivity extends AppCompatActivity {
             mainHandler.post(() -> {
                 if (renderGeneration.get() != gen) {
                     return;
+                }
+                if (shizukuError[0]) {
+                    toast("Could not read folder with Shizuku");
                 }
                 displayRows.clear();
                 displayRows.addAll(rows);
@@ -1496,42 +1488,76 @@ public class MainActivity extends AppCompatActivity {
      * Recursively builds tree rows into the provided lists using a shared dirCache.
      */
     private void buildTreeRows(File directory, int depth,
-            String query, Set<String> expanded, Set<File> selected,
+            String query, Set<String> expanded, Set<File> selected, File focusedDir,
             Comparator<File> cmp,
             List<FileListAdapter.Row> rows, List<File> rowFiles,
             Map<String, File[]> dirCache,
-            SimpleDateFormat dateFmt, boolean showHidden) {
-        File[] children = cachedListFiles(directory, dirCache);
+            SimpleDateFormat dateFmt, boolean showHidden,
+            boolean shizukuReady, boolean[] shizukuError) {
+        File[] children = listDirectoryChildren(directory, dirCache, true,
+                shizukuReady, shizukuError);
         if (children == null)
             return;
 
         List<File> childList = new ArrayList<>(Arrays.asList(children));
         childList.sort(cmp);
 
+        boolean scopedToFocusedAncestor = !query.isEmpty() && focusedDir != null
+                && !isAncestorOrSamePath(focusedDir.getAbsolutePath(), directory.getAbsolutePath());
+        String focusedPath = focusedDir == null ? null : focusedDir.getAbsolutePath();
+
         for (File file : childList) {
             if (!showHidden && file.getName().startsWith(".")) {
                 continue;
             }
             boolean isDir = file.isDirectory();
-            boolean matchesSearch = query.isEmpty()
-                    || file.getName().toLowerCase(Locale.ROOT).contains(query);
-            if (!query.isEmpty() && !matchesSearch && !isDir)
-                continue;
+            String filePath = file.getAbsolutePath();
+            boolean isExpanded = isDir && expanded.contains(filePath);
+            boolean isFocused = focusedPath != null && filePath.equals(focusedPath);
 
-            boolean isExpanded = isDir && expanded.contains(file.getAbsolutePath());
-            File[] grandChildren = isDir ? cachedListFiles(file, dirCache) : null;
+            if (scopedToFocusedAncestor) {
+                if (!isDir || !isAncestorOrSamePath(filePath, focusedPath)) {
+                    continue;
+                }
+            } else {
+                boolean matchesSearch = query.isEmpty()
+                        || file.getName().toLowerCase(Locale.ROOT).contains(query);
+                if (!query.isEmpty() && !matchesSearch && (!isDir || !isExpanded)) {
+                    continue;
+                }
+            }
+
+            List<FileListAdapter.Row> descendantRows = null;
+            List<File> descendantFiles = null;
+            if (isDir && isExpanded) {
+                descendantRows = new ArrayList<>();
+                descendantFiles = new ArrayList<>();
+                buildTreeRows(file, depth + 1, query, expanded, selected, focusedDir,
+                        cmp, descendantRows, descendantFiles, dirCache, dateFmt, showHidden,
+                        shizukuReady, shizukuError);
+                boolean matchesSearch = query.isEmpty()
+                        || file.getName().toLowerCase(Locale.ROOT).contains(query);
+                if (!scopedToFocusedAncestor && !query.isEmpty()
+                        && !matchesSearch && descendantRows.isEmpty()) {
+                    continue;
+                }
+            }
+
+            File[] grandChildren = isDir
+                    ? listDirectoryChildren(file, dirCache, isExpanded, shizukuReady, null)
+                    : null;
             boolean hasChildren = grandChildren != null && grandChildren.length > 0;
 
             rows.add(FileListAdapter.Row.treeNode(
                     file,
                     fileDetailsFromCache(file, grandChildren, dateFmt),
-                    selected.contains(file),
+                    selected.contains(file), isFocused,
                     depth, isDir, isExpanded, hasChildren));
             rowFiles.add(file);
 
-            if (isDir && isExpanded) {
-                buildTreeRows(file, depth + 1, query, expanded, selected,
-                        cmp, rows, rowFiles, dirCache, dateFmt, showHidden);
+            if (descendantRows != null) {
+                rows.addAll(descendantRows);
+                rowFiles.addAll(descendantFiles);
             }
         }
     }
@@ -1540,19 +1566,33 @@ public class MainActivity extends AppCompatActivity {
             String query, Set<String> expanded, Set<File> selected,
             List<FileListAdapter.Row> rows, List<File> files) {
         for (ArchiveBrowserNode node : parent.children.values()) {
-            if (!query.isEmpty() && !node.name.toLowerCase(Locale.ROOT).contains(query)) {
+            boolean matchesSearch = query.isEmpty()
+                    || node.name.toLowerCase(Locale.ROOT).contains(query);
+            boolean isExpanded = node.directory && expanded.contains(node.path);
+            if (!query.isEmpty() && !matchesSearch && (!node.directory || !isExpanded)) {
                 continue;
             }
+            List<FileListAdapter.Row> descendantRows = null;
+            List<File> descendantFiles = null;
+            if (isExpanded) {
+                descendantRows = new ArrayList<>();
+                descendantFiles = new ArrayList<>();
+                buildArchiveRows(archive, node, depth + 1, query, expanded, selected,
+                        descendantRows, descendantFiles);
+                if (!query.isEmpty() && !matchesSearch && descendantRows.isEmpty()) {
+                    continue;
+                }
+            }
             ArchiveEntryFile file = new ArchiveEntryFile(archive, node);
-            boolean isExpanded = node.directory && expanded.contains(node.path);
             String details = node.directory
                     ? node.children.size() + (node.children.size() == 1 ? " item" : " items")
                     : node.size < 0 ? "File" : formatFileSize(node.size);
                 rows.add(FileListAdapter.Row.archiveNode(file, details, selected.contains(file), depth,
                     node.directory, isExpanded, !node.children.isEmpty()));
             files.add(file);
-            if (isExpanded) {
-                buildArchiveRows(archive, node, depth + 1, query, expanded, selected, rows, files);
+            if (descendantRows != null) {
+                rows.addAll(descendantRows);
+                files.addAll(descendantFiles);
             }
         }
     }
@@ -1584,24 +1624,44 @@ public class MainActivity extends AppCompatActivity {
 
     private void buildFlatRows(String groupName, List<File> files, Set<File> selected,
             List<FileListAdapter.Row> rows, List<File> rowFiles,
-            Map<String, File[]> dirCache, SimpleDateFormat dateFmt) {
+            Map<String, File[]> dirCache, SimpleDateFormat dateFmt, boolean shizukuReady) {
         if (groupName != null) {
             rows.add(FileListAdapter.Row.heading(groupName));
             rowFiles.add(null);
         }
         for (File file : files) {
-            File[] children = file.isDirectory() ? cachedListFiles(file, dirCache) : null;
+            File[] children = file.isDirectory()
+                    ? listDirectoryChildren(file, dirCache, false, shizukuReady, null)
+                    : null;
             rows.add(FileListAdapter.Row.file(
                     file, fileDetailsFromCache(file, children, dateFmt), selected.contains(file)));
             rowFiles.add(file);
         }
     }
 
-    /** Returns cached listFiles result, or fetches and stores it. */
-    private File[] cachedListFiles(File dir, Map<String, File[]> cache) {
+    /** Returns cached listFiles result, or fetches and stores it (using Shizuku when allowed). */
+    private File[] listDirectoryChildren(File dir, Map<String, File[]> cache,
+            boolean allowShizuku, boolean shizukuReady, boolean[] shizukuErrorOut) {
         String key = dir.getAbsolutePath();
-        if (cache.containsKey(key))
+        if (cache.containsKey(key)) {
             return cache.get(key);
+        }
+        if (ShizukuFileHelper.isShizukuTarget(dir)) {
+            if (!allowShizuku || !shizukuReady) {
+                return null;
+            }
+            try {
+                List<ShizukuFile> entries = ShizukuFileHelper.listDirectory(key);
+                File[] result = entries.toArray(new File[0]);
+                cache.put(key, result);
+                return result;
+            } catch (Exception exception) {
+                if (shizukuErrorOut != null) {
+                    shizukuErrorOut[0] = true;
+                }
+                return null;
+            }
+        }
         File[] result = dir.listFiles();
         cache.put(key, result);
         return result;
@@ -1705,27 +1765,38 @@ public class MainActivity extends AppCompatActivity {
         }
         if (StorageHelper.isStorageRoot(requested)) {
             requested = new File(StorageHelper.STORAGE_ROOT_PATH);
+        } else if (isRestrictedAndroidDataFolder(requested)
+                || ((!requested.isDirectory() || !requested.canRead()) && hasShizukuAccess())) {
+            if (!hasShizukuAccess()) {
+                openRestrictedFolderAutomatically(requested, false);
+                return;
+            }
+            File targetDir = requested;
+            renderExecutor.execute(() -> {
+                boolean validDir = false;
+                try {
+                    validDir = ShizukuFileHelper.isDirectory(targetDir.getAbsolutePath());
+                } catch (Exception ignored) {
+                }
+                boolean isDir = validDir;
+                mainHandler.post(() -> {
+                    if (isDir) {
+                        navigateToDirectory(ShizukuFile.directory(targetDir.getAbsolutePath()));
+                    } else {
+                        toast("Folder not found or cannot be read");
+                    }
+                });
+            });
+            return;
         } else if (!requested.isDirectory() || !requested.canRead()) {
             toast("Folder not found or cannot be read");
             return;
         }
-        leaveArchiveBrowser();
-        currentDirectory = requested;
-        selectedFiles.clear();
-        pendingFocusDirectory = null;
-        searchInput.setText("");
-        showFiles();
-        scrollToTop();
+        navigateToDirectory(requested);
     }
 
     private void goToStorageDevices() {
-        leaveArchiveBrowser();
-        currentDirectory = new File(StorageHelper.STORAGE_ROOT_PATH);
-        selectedFiles.clear();
-        pendingFocusDirectory = null;
-        searchInput.setText("");
-        showFiles();
-        scrollToTop();
+        navigateToDirectory(new File(StorageHelper.STORAGE_ROOT_PATH));
     }
 
     private void goUp() {
@@ -1770,6 +1841,10 @@ public class MainActivity extends AppCompatActivity {
             parent = new File(StorageHelper.STORAGE_ROOT_PATH);
         }
 
+        if (parent != null && isRestrictedAndroidDataFolder(parent) && hasShizukuAccess()) {
+            parent = ShizukuFile.wrap(parent, true);
+        }
+
         if (parent != null && (parent.canRead() || StorageHelper.isStorageRoot(parent))) {
             currentDirectory = parent;
             lastClickedDirectory = parent;
@@ -1782,13 +1857,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void goHome() {
-        leaveArchiveBrowser();
-        currentDirectory = homeDirectory;
-        selectedFiles.clear();
-        pendingFocusDirectory = null;
-        searchInput.setText("");
-        showFiles();
-        scrollToTop();
+        navigateToDirectory(homeDirectory);
     }
 
     private void scrollToTop() {
@@ -1830,6 +1899,37 @@ public class MainActivity extends AppCompatActivity {
                         nameInput.setError("Enter a valid name without path separators");
                         return;
                     }
+                    if (ShizukuFileHelper.isShizukuTarget(currentDirectory)) {
+                        if (!hasShizukuAccess()) {
+                            toast("Current folder cannot be changed");
+                            return;
+                        }
+                        String destPath = ShizukuFileHelper.joinPath(
+                                currentDirectory.getAbsolutePath(), name);
+                        renderExecutor.execute(() -> {
+                            try {
+                                if (ShizukuFileHelper.exists(destPath)) {
+                                    mainHandler.post(() -> nameInput.setError(
+                                            "An item with this name already exists"));
+                                    return;
+                                }
+                                if (createDirectory) {
+                                    ShizukuFileHelper.mkdir(destPath);
+                                } else {
+                                    ShizukuFileHelper.createNewFile(destPath);
+                                }
+                                mainHandler.post(() -> {
+                                    dialog.dismiss();
+                                    showFiles();
+                                    toast(createDirectory ? "Folder created" : "File created");
+                                });
+                            } catch (Exception exception) {
+                                mainHandler.post(() -> toast(createDirectory
+                                        ? "Could not create folder" : "Could not create file"));
+                            }
+                        });
+                        return;
+                    }
                     File destination = new File(currentDirectory, name);
                     if (destination.exists()) {
                         nameInput.setError("An item with this name already exists");
@@ -1858,7 +1958,9 @@ public class MainActivity extends AppCompatActivity {
 
     private void showRenameDialog(File source) {
         File parent = source.getParentFile();
-        if (parent == null || !parent.canWrite()) {
+        boolean shizukuSource = ShizukuFileHelper.isShizukuTarget(source);
+        if (parent == null || (!shizukuSource && !parent.canWrite())
+                || (shizukuSource && !hasShizukuAccess())) {
             toast("This item cannot be renamed");
             return;
         }
@@ -1884,6 +1986,37 @@ public class MainActivity extends AppCompatActivity {
                     }
                     if (source.getName().equals(name)) {
                         dialog.dismiss();
+                        return;
+                    }
+                    if (shizukuSource) {
+                        String destPath = ShizukuFileHelper.joinPath(
+                                parent.getAbsolutePath(), name);
+                        renderExecutor.execute(() -> {
+                            try {
+                                if (ShizukuFileHelper.exists(destPath)) {
+                                    mainHandler.post(() -> nameInput.setError(
+                                            "An item with this name already exists"));
+                                    return;
+                                }
+                                ShizukuFileHelper.rename(source.getAbsolutePath(), destPath);
+                                File renamed = new ShizukuFile(destPath, name,
+                                        source.isDirectory(), source.length(),
+                                        source.lastModified());
+                                mainHandler.post(() -> {
+                                    for (int index = 0; index < clipboardFiles.size(); index++) {
+                                        if (clipboardFiles.get(index).equals(source)) {
+                                            clipboardFiles.set(index, renamed);
+                                        }
+                                    }
+                                    selectedFiles.clear();
+                                    dialog.dismiss();
+                                    showFiles();
+                                    toast("Item renamed");
+                                });
+                            } catch (Exception exception) {
+                                mainHandler.post(() -> toast("Could not rename item"));
+                            }
+                        });
                         return;
                     }
                     File destination = new File(parent, name);
@@ -1914,6 +2047,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void showPropertiesDialog(File file) {
+        boolean isShizuku = file instanceof ShizukuFile;
         String type = file.isDirectory() ? "Folder"
                 : fileExtension(file).isEmpty() ? "File" : fileExtension(file).toUpperCase(Locale.ROOT);
         String size = file.isDirectory()
@@ -1921,11 +2055,13 @@ public class MainActivity extends AppCompatActivity {
                 : StorageHelper.formatSize(file.length());
         String modified = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
                 .format(new Date(file.lastModified()));
+        String readableLabel = isShizuku ? "Yes (Shizuku)" : (file.canRead() ? "Yes" : "No");
+        String writableLabel = isShizuku ? "Yes (Shizuku)" : (file.canWrite() ? "Yes" : "No");
         String details = "Type: " + type
                 + "\nSize: " + size
                 + "\nModified: " + modified
-                + "\nReadable: " + (file.canRead() ? "Yes" : "No")
-                + "\nWritable: " + (file.canWrite() ? "Yes" : "No")
+                + "\nReadable: " + readableLabel
+                + "\nWritable: " + writableLabel
                 + "\n\nPath: " + file.getAbsolutePath();
 
         AlertDialog dialog = new AlertDialog.Builder(this)
@@ -1935,8 +2071,17 @@ public class MainActivity extends AppCompatActivity {
                 .show();
 
         if (file.isDirectory()) {
-            Executors.newSingleThreadExecutor().execute(() -> {
-                long[] stats = calculateFolderStats(file);
+            renderExecutor.execute(() -> {
+                long[] stats;
+                if (isShizuku) {
+                    try {
+                        stats = ShizukuFileHelper.calculateFolderStats(file.getAbsolutePath());
+                    } catch (Exception exception) {
+                        stats = new long[] { 0L, 0L, 0L };
+                    }
+                } else {
+                    stats = calculateFolderStats(file);
+                }
                 String updatedSize = StorageHelper.formatSize(stats[0])
                         + " (" + stats[1] + " file" + (stats[1] == 1 ? "" : "s")
                         + ", " + stats[2] + " folder" + (stats[2] == 1 ? "" : "s") + ")";
@@ -1945,8 +2090,8 @@ public class MainActivity extends AppCompatActivity {
                         String updatedDetails = "Type: " + type
                                 + "\nSize: " + updatedSize
                                 + "\nModified: " + modified
-                                + "\nReadable: " + (file.canRead() ? "Yes" : "No")
-                                + "\nWritable: " + (file.canWrite() ? "Yes" : "No")
+                                + "\nReadable: " + readableLabel
+                                + "\nWritable: " + writableLabel
                                 + "\n\nPath: " + file.getAbsolutePath();
                         dialog.setMessage(updatedDetails);
                     }
@@ -1983,15 +2128,44 @@ public class MainActivity extends AppCompatActivity {
     private void shareFiles(List<File> files) {
         if (files == null || files.isEmpty()) return;
         List<File> fileOnlyList = new ArrayList<>();
+        boolean hasShizukuFiles = false;
         for (File f : files) {
             if (f != null && f.isFile()) {
                 fileOnlyList.add(f);
+                if (f instanceof ShizukuFile) {
+                    hasShizukuFiles = true;
+                }
             }
         }
         if (fileOnlyList.isEmpty()) {
             toast("Folders cannot be shared directly. Compress to ZIP first.");
             return;
         }
+        if (hasShizukuFiles) {
+            runArchiveOperation("Preparing files to share", progress -> {
+                List<File> stagedFiles = new ArrayList<>();
+                for (int i = 0; i < fileOnlyList.size(); i++) {
+                    File f = fileOnlyList.get(i);
+                    progress.update(f.getName(), i, fileOnlyList.size(), 0, 0);
+                    if (f instanceof ShizukuFile) {
+                        int index = i;
+                        stagedFiles.add(ShizukuFileHelper.stageToCache(MainActivity.this,
+                                (ShizukuFile) f,
+                                (item, c, t, bytes, total) -> progress.update(
+                                        f.getName(), index, fileOnlyList.size(), bytes, total)));
+                    } else {
+                        stagedFiles.add(f);
+                    }
+                }
+                mainHandler.post(() -> launchShareChooser(stagedFiles));
+                return null;
+            }, false, false, null);
+            return;
+        }
+        launchShareChooser(fileOnlyList);
+    }
+
+    private void launchShareChooser(List<File> fileOnlyList) {
         try {
             Intent intent = new Intent();
             if (fileOnlyList.size() == 1) {
@@ -2020,7 +2194,8 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void showChecksumDialog(File file) {
-        if (!file.isFile() || !file.canRead()) {
+        boolean isShizuku = file instanceof ShizukuFile;
+        if (!file.isFile() || (!isShizuku && !file.canRead())) {
             toast("Cannot read file for checksum");
             return;
         }
@@ -2030,22 +2205,30 @@ public class MainActivity extends AppCompatActivity {
                 .setCancelable(false)
                 .show();
 
-        Executors.newSingleThreadExecutor().execute(() -> {
+        renderExecutor.execute(() -> {
             try {
-                java.security.MessageDigest md5Digest = java.security.MessageDigest.getInstance("MD5");
-                java.security.MessageDigest sha256Digest = java.security.MessageDigest.getInstance("SHA-256");
+                final String md5;
+                final String sha256;
+                if (isShizuku) {
+                    String[] hashes = ShizukuFileHelper.computeChecksums(file.getAbsolutePath());
+                    md5 = hashes[0];
+                    sha256 = hashes[1];
+                } else {
+                    java.security.MessageDigest md5Digest = java.security.MessageDigest.getInstance("MD5");
+                    java.security.MessageDigest sha256Digest = java.security.MessageDigest.getInstance("SHA-256");
 
-                try (FileInputStream fis = new FileInputStream(file)) {
-                    byte[] buffer = new byte[16384];
-                    int read;
-                    while ((read = fis.read(buffer)) != -1) {
-                        md5Digest.update(buffer, 0, read);
-                        sha256Digest.update(buffer, 0, read);
+                    try (FileInputStream fis = new FileInputStream(file)) {
+                        byte[] buffer = new byte[16384];
+                        int read;
+                        while ((read = fis.read(buffer)) != -1) {
+                            md5Digest.update(buffer, 0, read);
+                            sha256Digest.update(buffer, 0, read);
+                        }
                     }
-                }
 
-                String md5 = bytesToHex(md5Digest.digest());
-                String sha256 = bytesToHex(sha256Digest.digest());
+                    md5 = bytesToHex(md5Digest.digest());
+                    sha256 = bytesToHex(sha256Digest.digest());
+                }
 
                 mainHandler.post(() -> {
                     if (progressDialog.isShowing()) {
@@ -2090,6 +2273,10 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void openWithExternalAppChooser(File file) {
+        if (file instanceof ShizukuFile) {
+            stageShizukuFileAndRun((ShizukuFile) file, this::openWithExternalAppChooser);
+            return;
+        }
         String ext = fileExtension(file);
         String mimeType = "apk".equals(ext)
                 ? "application/vnd.android.package-archive"
@@ -2187,7 +2374,8 @@ public class MainActivity extends AppCompatActivity {
                             ? name
                             : name + extension;
                     File output = new File(currentDirectory, outputName);
-                    if (output.exists()) {
+                    boolean destIsShizuku = ShizukuFileHelper.isShizukuTarget(currentDirectory);
+                    if (!destIsShizuku && output.exists()) {
                         nameInput.setError("An item with this name already exists");
                         return;
                     }
@@ -2195,9 +2383,62 @@ public class MainActivity extends AppCompatActivity {
                             : archivePasswordInput.getText().toString().toCharArray();
                     dialog.dismiss();
                     runArchiveOperation("Creating " + output.getName(), progress -> {
+                        File tempWorkDir = null;
                         try {
-                            ArchiveManager.Result result = ArchiveManager.create(sources,
-                                    output, format, password.length == 0 ? null : password);
+                            if (destIsShizuku
+                                    && ShizukuFileHelper.exists(output.getAbsolutePath())) {
+                                throw new IOException("An item with this name already exists");
+                            }
+                            boolean hasShizukuSources = false;
+                            for (File source : sources) {
+                                if (source instanceof ShizukuFile) {
+                                    hasShizukuSources = true;
+                                    break;
+                                }
+                            }
+                            List<File> archiveSources = sources;
+                            if (hasShizukuSources || destIsShizuku) {
+                                tempWorkDir = new File(getCacheDir(),
+                                        "shizuku_archive_" + System.currentTimeMillis());
+                                File sourceStageDir = new File(tempWorkDir, "sources");
+                                if (!sourceStageDir.mkdirs()) {
+                                    throw new IOException("Could not create temporary staging directory");
+                                }
+                                if (hasShizukuSources) {
+                                    archiveSources = new ArrayList<>();
+                                    int totalItems = 0;
+                                    for (File source : sources) {
+                                        if (source instanceof ShizukuFile) {
+                                            totalItems += ShizukuFileHelper.countItemsRecursively(
+                                                    source.getAbsolutePath());
+                                        } else {
+                                            totalItems += countItemsRecursively(source);
+                                        }
+                                    }
+                                    int[] completed = { 0 };
+                                    for (File source : sources) {
+                                        if (source instanceof ShizukuFile) {
+                                            File stagedItem = new File(sourceStageDir, source.getName());
+                                            ShizukuFileHelper.copyRemoteToLocalRecursively(
+                                                    (ShizukuFile) source, stagedItem,
+                                                    completed, totalItems, progress::update);
+                                            archiveSources.add(stagedItem);
+                                        } else {
+                                            archiveSources.add(source);
+                                        }
+                                    }
+                                }
+                            }
+                            File localOutput = destIsShizuku
+                                    ? new File(tempWorkDir, outputName)
+                                    : output;
+                            ArchiveManager.Result result = ArchiveManager.create(archiveSources,
+                                    localOutput, format, password.length == 0 ? null : password);
+                            if (destIsShizuku) {
+                                progress.update(output.getName(), 0, 1, 0, localOutput.length());
+                                ShizukuFileHelper.writeLocalToRemote(
+                                        localOutput, output.getAbsolutePath(), progress::update);
+                            }
                             double saved = result.savedPercent();
                             String ratio = saved >= 0
                                     ? String.format(Locale.getDefault(), "%.1f%% smaller", saved)
@@ -2207,6 +2448,9 @@ public class MainActivity extends AppCompatActivity {
                                     + formatFileSize(result.originalBytes) + "\nArchive: "
                                     + formatFileSize(result.archiveBytes) + "\n" + ratio;
                         } finally {
+                            if (tempWorkDir != null) {
+                                deleteRecursively(tempWorkDir);
+                            }
                             Arrays.fill(password, '\0');
                         }
                     }, true);
@@ -2248,6 +2492,7 @@ public class MainActivity extends AppCompatActivity {
         dialog.setOnShowListener(ignored -> dialog.getButton(AlertDialog.BUTTON_POSITIVE)
                 .setOnClickListener(view -> {
                     File destination = null;
+                    boolean destIsShizuku = extract && ShizukuFileHelper.isShizukuTarget(currentDirectory);
                     if (extract) {
                         String name = targetInput.getText().toString().trim();
                         if (!isValidLocalName(name)) {
@@ -2255,7 +2500,7 @@ public class MainActivity extends AppCompatActivity {
                             return;
                         }
                         destination = new File(currentDirectory, name);
-                        if (destination.exists()) {
+                        if (!destIsShizuku && destination.exists()) {
                             targetInput.setError("That folder already exists");
                             return;
                         }
@@ -2265,7 +2510,12 @@ public class MainActivity extends AppCompatActivity {
                     dialog.dismiss();
                     if (extract) {
                         runArchiveOperation("Extracting " + archive.getName(), progress -> {
+                            File tempExtractDir = null;
                             try {
+                                if (destIsShizuku
+                                        && ShizukuFileHelper.exists(extractFolder.getAbsolutePath())) {
+                                    throw new IOException("That folder already exists");
+                                }
                                 progress.update("Scanning archive", 0, 0, 0, 0);
                                 List<ArchiveManager.EntryInfo> entries = ArchiveManager.listEntries(
                                         archive, password.length == 0 ? null : password);
@@ -2276,14 +2526,30 @@ public class MainActivity extends AppCompatActivity {
                                     }
                                 }
                                 int extractionTotal = totalFiles;
-                                int count = ArchiveManager.extract(archive, extractFolder,
+                                File localTarget = extractFolder;
+                                if (destIsShizuku) {
+                                    tempExtractDir = new File(getCacheDir(),
+                                            "shizuku_extract_" + System.currentTimeMillis());
+                                    localTarget = tempExtractDir;
+                                }
+                                int count = ArchiveManager.extract(archive, localTarget,
                                         password.length == 0 ? null : password,
                                         (fileName, completed, bytesCopied, totalBytes) ->
                                             progress.update(fileName, completed,
                                                 extractionTotal, bytesCopied, totalBytes));
+                                if (destIsShizuku) {
+                                    int itemCount = countItemsRecursively(localTarget);
+                                    int[] copiedCount = { 0 };
+                                    ShizukuFileHelper.copyLocalToRemoteRecursively(
+                                            localTarget, extractFolder.getAbsolutePath(),
+                                            copiedCount, itemCount, progress::update);
+                                }
                                 return "Extracted " + count + " file(s) to "
                                         + extractFolder.getAbsolutePath();
                             } finally {
+                                if (tempExtractDir != null) {
+                                    deleteRecursively(tempExtractDir);
+                                }
                                 Arrays.fill(password, '\0');
                             }
                         }, true);
@@ -2884,6 +3150,14 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void pasteClipboard(File targetDirectory) {
+        boolean targetIsShizuku = ShizukuFileHelper.isShizukuTarget(targetDirectory);
+        if (targetIsShizuku) {
+            if (!hasShizukuAccess()) {
+                toast("Shizuku access is required to write to this folder");
+                return;
+            }
+            targetDirectory = ShizukuFile.wrap(targetDirectory, true);
+        }
         if (!archiveClipboardEntries.isEmpty()) {
             pasteArchiveClipboard(targetDirectory);
             return;
@@ -2892,7 +3166,7 @@ public class MainActivity extends AppCompatActivity {
             toast("Clipboard is empty");
             return;
         }
-        if (!targetDirectory.isDirectory() || !targetDirectory.canWrite()) {
+        if (!targetIsShizuku && (!targetDirectory.isDirectory() || !targetDirectory.canWrite())) {
             toast("Destination folder cannot be written");
             return;
         }
@@ -2901,7 +3175,8 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void pasteArchiveClipboard(File targetDirectory) {
-        if (!targetDirectory.isDirectory() || !targetDirectory.canWrite()) {
+        boolean targetIsShizuku = ShizukuFileHelper.isShizukuTarget(targetDirectory);
+        if (!targetIsShizuku && (!targetDirectory.isDirectory() || !targetDirectory.canWrite())) {
             toast("Destination folder cannot be written");
             return;
         }
@@ -2917,7 +3192,15 @@ public class MainActivity extends AppCompatActivity {
             int copied = 0;
             int skipped = 0;
             int failed = 0;
+            File tempExtractDir = null;
             try {
+                if (targetIsShizuku) {
+                    tempExtractDir = new File(getCacheDir(),
+                            "shizuku_arch_paste_" + System.currentTimeMillis());
+                    if (!tempExtractDir.mkdirs()) {
+                        throw new IOException("Could not create temporary staging directory");
+                    }
+                }
                 for (String entry : entries) {
                     String path = entry.endsWith("/")
                             ? entry.substring(0, entry.length() - 1) : entry;
@@ -2925,25 +3208,40 @@ public class MainActivity extends AppCompatActivity {
                     String outputName = path.substring(separator + 1);
                     int completed = copied + skipped + failed;
                     progress.update(outputName, completed, entries.size(), 0, 0);
-                    if (new File(targetDirectory, outputName).exists()) {
+                    String remoteTargetPath = ShizukuFileHelper.joinPath(
+                            targetDirectory.getAbsolutePath(), outputName);
+                    boolean exists = targetIsShizuku
+                            ? ShizukuFileHelper.exists(remoteTargetPath)
+                            : new File(targetDirectory, outputName).exists();
+                    if (exists) {
                         skipped++;
                         progress.update(outputName, completed + 1, entries.size(), 0, 0);
                         continue;
                     }
+                    File extractTarget = targetIsShizuku ? tempExtractDir : targetDirectory;
                     try {
                         int extracted = ArchiveManager.extractEntries(archive,
-                                Collections.singletonList(entry), targetDirectory,
+                                Collections.singletonList(entry), extractTarget,
                             password.length == 0 ? null : password,
                             (fileName, extractedFiles, bytesCopied, totalBytes) ->
                                 progress.update(fileName, completed, entries.size(),
                                     bytesCopied, totalBytes));
                         if (extracted > 0 || entry.endsWith("/")) {
+                            if (targetIsShizuku) {
+                                File extractedItem = new File(tempExtractDir, outputName);
+                                int itemCount = countItemsRecursively(extractedItem);
+                                int[] subCompleted = { 0 };
+                                ShizukuFileHelper.copyLocalToRemoteRecursively(
+                                        extractedItem, remoteTargetPath,
+                                        subCompleted, itemCount, progress::update);
+                                deleteRecursively(extractedItem);
+                            }
                             copied++;
                         } else {
                             failed++;
                         }
                     } catch (Exception exception) {
-                        deleteRecursively(new File(targetDirectory, outputName));
+                        deleteRecursively(new File(extractTarget, outputName));
                         failed++;
                     }
                         progress.update(outputName, copied + skipped + failed,
@@ -2952,6 +3250,9 @@ public class MainActivity extends AppCompatActivity {
                 return "Paste complete. " + copied + " copied, " + skipped
                         + " skipped, " + failed + " failed";
             } finally {
+                if (tempExtractDir != null) {
+                    deleteRecursively(tempExtractDir);
+                }
                 Arrays.fill(password, '\0');
             }
         }, true);
@@ -2965,7 +3266,13 @@ public class MainActivity extends AppCompatActivity {
         }
 
         File source = sources.get(index);
-        File destination = new File(targetDirectory, source.getName());
+        boolean targetIsShizuku = ShizukuFileHelper.isShizukuTarget(targetDirectory);
+        File destination = targetIsShizuku
+                ? new ShizukuFile(ShizukuFileHelper.joinPath(
+                        targetDirectory.getAbsolutePath(), source.getName()),
+                        source.getName(), source.isDirectory(), source.length(),
+                        source.lastModified())
+                : new File(targetDirectory, source.getName());
         try {
             String sourcePath = source.getCanonicalPath();
             String destinationPath = destination.getCanonicalPath();
@@ -2982,7 +3289,28 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
-        if (destination.exists() && conflictPolicy == CONFLICT_ASK) {
+        if (targetIsShizuku) {
+            renderExecutor.execute(() -> {
+                boolean exists = false;
+                try {
+                    exists = ShizukuFileHelper.exists(destination.getAbsolutePath());
+                } catch (Exception ignored) {
+                }
+                boolean destExists = exists;
+                mainHandler.post(() -> handlePasteConflictOrCopy(sources, index, targetDirectory,
+                        conflictPolicy, progress, source, destination, destExists));
+            });
+            return;
+        }
+
+        handlePasteConflictOrCopy(sources, index, targetDirectory, conflictPolicy, progress,
+                source, destination, destination.exists());
+    }
+
+    private void handlePasteConflictOrCopy(List<File> sources, int index, File targetDirectory,
+            int conflictPolicy, PasteProgress progress, File source, File destination,
+            boolean destinationExists) {
+        if (destinationExists && conflictPolicy == CONFLICT_ASK) {
             String[] choices = { "Replace", "Skip", "Replace all", "Skip all", "Cancel" };
             new AlertDialog.Builder(this)
                     .setTitle("Already exists: " + source.getName())
@@ -3019,7 +3347,7 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
-        if (destination.exists() && conflictPolicy == CONFLICT_SKIP_ALL) {
+        if (destinationExists && conflictPolicy == CONFLICT_SKIP_ALL) {
             progress.skipped++;
             processPasteItem(sources, index + 1, targetDirectory, conflictPolicy, progress);
             return;
@@ -3031,13 +3359,32 @@ public class MainActivity extends AppCompatActivity {
 
     private void copyPasteItem(File source, File destination, PasteProgress pasteProgress,
             Runnable onComplete) {
+        boolean sourceIsShizuku = source instanceof ShizukuFile;
+        boolean destIsShizuku = destination instanceof ShizukuFile;
         runArchiveOperation("Copying " + source.getName(), progress -> {
-            int total = countItemsRecursively(source);
-            int[] completed = { 0 };
             try {
-                copyRecursively(source, destination, total, completed, progress);
+                if (sourceIsShizuku && destIsShizuku) {
+                    progress.update(source.getAbsolutePath(), 0, 1, 0, 0);
+                    ShizukuFileHelper.copyWithinShizuku(source.getAbsolutePath(),
+                            destination.getAbsolutePath(), source.isDirectory());
+                    progress.update(source.getAbsolutePath(), 1, 1, 0, 0);
+                } else if (sourceIsShizuku) {
+                    int total = ShizukuFileHelper.countItemsRecursively(source.getAbsolutePath());
+                    int[] completed = { 0 };
+                    ShizukuFileHelper.copyRemoteToLocalRecursively((ShizukuFile) source,
+                            destination, completed, total, progress::update);
+                } else if (destIsShizuku) {
+                    int total = countItemsRecursively(source);
+                    int[] completed = { 0 };
+                    ShizukuFileHelper.copyLocalToRemoteRecursively(source,
+                            destination.getAbsolutePath(), completed, total, progress::update);
+                } else {
+                    int total = countItemsRecursively(source);
+                    int[] completed = { 0 };
+                    copyRecursively(source, destination, total, completed, progress);
+                }
                 pasteProgress.copied++;
-            } catch (IOException exception) {
+            } catch (Exception exception) {
                 pasteProgress.failed++;
             }
             return null;
@@ -3067,13 +3414,27 @@ public class MainActivity extends AppCompatActivity {
                     runArchiveOperation("Deleting files", progress -> {
                         int total = 0;
                         for (File file : files) {
-                            total += countItemsRecursively(file);
+                            if (file instanceof ShizukuFile) {
+                                total++;
+                            } else {
+                                total += countItemsRecursively(file);
+                            }
                         }
                         int[] completed = { 0 };
                         int deleted = 0;
                         int failed = 0;
                         for (File file : files) {
-                            if (deleteRecursively(file, total, completed, progress)) {
+                            if (file instanceof ShizukuFile) {
+                                progress.update(file.getAbsolutePath(), completed[0], total, 0, 0);
+                                try {
+                                    ShizukuFileHelper.deleteRecursively(file.getAbsolutePath());
+                                    deleted++;
+                                } catch (Exception exception) {
+                                    failed++;
+                                }
+                                completed[0]++;
+                                progress.update(file.getAbsolutePath(), completed[0], total, 0, 0);
+                            } else if (deleteRecursively(file, total, completed, progress)) {
                                 deleted++;
                             } else {
                                 failed++;
@@ -3086,6 +3447,11 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void openFile(File file) {
+        if (file instanceof ShizukuFile) {
+            ShizukuFile remote = (ShizukuFile) file;
+            stageShizukuFileAndRun(remote, staged -> openStagedShizukuFile(remote, staged));
+            return;
+        }
         if (!file.isFile() || !file.canRead()) {
             toast("File cannot be opened");
             return;
@@ -3101,6 +3467,27 @@ public class MainActivity extends AppCompatActivity {
         if (openFileInternally(file, mimeType))
             return;
         openFileWithMimeType(file, mimeType);
+    }
+
+    private void openStagedShizukuFile(ShizukuFile original, File staged) {
+        String extension = fileExtension(original);
+        String mimeType = "apk".equals(extension)
+                ? "application/vnd.android.package-archive"
+                : MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension);
+        if (mimeType == null) {
+            mimeType = "*/*";
+        }
+        if (mimeType.startsWith("text/") || isTextExtension(extension)) {
+            Intent intent = new Intent(this, TextEditorActivity.class);
+            intent.putExtra(TextEditorActivity.EXTRA_FILE_PATH, staged.getAbsolutePath());
+            intent.putExtra(TextEditorActivity.EXTRA_SHIZUKU_TARGET_PATH, original.getAbsolutePath());
+            startActivity(intent);
+            return;
+        }
+        if (openFileInternally(staged, mimeType)) {
+            return;
+        }
+        openFileWithMimeType(staged, mimeType);
     }
 
     /** Returns true if an internal viewer handled the file. */
@@ -3184,61 +3571,79 @@ public class MainActivity extends AppCompatActivity {
         new AlertDialog.Builder(this)
                 .setTitle("Open as")
                 .setItems(labels, (dialog, which) -> {
-                    switch (which) {
-                        case 0:
-                            openFile(file);
-                            break;
-                        case 1: {
-                            Intent i = new Intent(this, TextEditorActivity.class);
-                            i.putExtra(TextEditorActivity.EXTRA_FILE_PATH, file.getAbsolutePath());
-                            startActivity(i);
-                            break;
-                        }
-                        case 2: {
-                            Intent i = new Intent(this, ImageViewerActivity.class);
-                            i.putExtra(ImageViewerActivity.EXTRA_FILE_PATH, file.getAbsolutePath());
-                            startActivity(i);
-                            break;
-                        }
-                        case 3: {
-                            Intent i = new Intent(this, AudioPlayerActivity.class);
-                            i.putExtra(AudioPlayerActivity.EXTRA_FILE_PATH, file.getAbsolutePath());
-                            startActivity(i);
-                            break;
-                        }
-                        case 4: {
-                            Intent i = new Intent(this, VideoPlayerActivity.class);
-                            i.putExtra(VideoPlayerActivity.EXTRA_FILE_PATH, file.getAbsolutePath());
-                            startActivity(i);
-                            break;
-                        }
-                        case 5:
-                            openFileWithMimeType(file, "text/plain");
-                            break;
-                        case 6:
-                            openFileWithMimeType(file, "audio/*");
-                            break;
-                        case 7:
-                            openFileWithMimeType(file, "video/*");
-                            break;
-                        case 8:
-                            openFileWithMimeType(file, "image/*");
-                            break;
-                        case 9:
-                            openFileWithMimeType(file, "application/pdf");
-                            break;
-                        case 10:
-                            openFileWithMimeType(file, "application/vnd.android.package-archive");
-                            break;
-                        case 11:
-                            openFileWithMimeType(file, "application/zip");
-                            break;
-                        case 12:
-                            openFileWithMimeType(file, "*/*");
-                            break;
+                    if (file instanceof ShizukuFile) {
+                        ShizukuFile remote = (ShizukuFile) file;
+                        stageShizukuFileAndRun(remote, staged ->
+                                openAsOption(staged, remote.getAbsolutePath(), which));
+                    } else {
+                        openAsOption(file, null, which);
                     }
                 })
                 .show();
+    }
+
+    private void openAsOption(File file, String shizukuTargetPath, int which) {
+        switch (which) {
+            case 0:
+                if (shizukuTargetPath != null) {
+                    openStagedShizukuFile(new ShizukuFile(shizukuTargetPath, file.getName(),
+                            false, file.length(), file.lastModified()), file);
+                } else {
+                    openFile(file);
+                }
+                break;
+            case 1: {
+                Intent i = new Intent(this, TextEditorActivity.class);
+                i.putExtra(TextEditorActivity.EXTRA_FILE_PATH, file.getAbsolutePath());
+                if (shizukuTargetPath != null) {
+                    i.putExtra(TextEditorActivity.EXTRA_SHIZUKU_TARGET_PATH, shizukuTargetPath);
+                }
+                startActivity(i);
+                break;
+            }
+            case 2: {
+                Intent i = new Intent(this, ImageViewerActivity.class);
+                i.putExtra(ImageViewerActivity.EXTRA_FILE_PATH, file.getAbsolutePath());
+                startActivity(i);
+                break;
+            }
+            case 3: {
+                Intent i = new Intent(this, AudioPlayerActivity.class);
+                i.putExtra(AudioPlayerActivity.EXTRA_FILE_PATH, file.getAbsolutePath());
+                startActivity(i);
+                break;
+            }
+            case 4: {
+                Intent i = new Intent(this, VideoPlayerActivity.class);
+                i.putExtra(VideoPlayerActivity.EXTRA_FILE_PATH, file.getAbsolutePath());
+                startActivity(i);
+                break;
+            }
+            case 5:
+                openFileWithMimeType(file, "text/plain");
+                break;
+            case 6:
+                openFileWithMimeType(file, "audio/*");
+                break;
+            case 7:
+                openFileWithMimeType(file, "video/*");
+                break;
+            case 8:
+                openFileWithMimeType(file, "image/*");
+                break;
+            case 9:
+                openFileWithMimeType(file, "application/pdf");
+                break;
+            case 10:
+                openFileWithMimeType(file, "application/vnd.android.package-archive");
+                break;
+            case 11:
+                openFileWithMimeType(file, "application/zip");
+                break;
+            case 12:
+                openFileWithMimeType(file, "*/*");
+                break;
+        }
     }
 
     private void openFileWithMimeType(File file, String mimeType) {

@@ -3,6 +3,9 @@
     <external-path
         name="shared_storage"
         path="." />
+    <cache-path
+        name="cache"
+        path="." />
     <root-path
         name="root_storage"
         path="." />

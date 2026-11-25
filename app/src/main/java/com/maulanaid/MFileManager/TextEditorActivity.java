@@ -38,11 +38,13 @@ import java.io.IOException;
 public class TextEditorActivity extends AppCompatActivity {
 
     public static final String EXTRA_FILE_PATH = "file_path";
+    public static final String EXTRA_SHIZUKU_TARGET_PATH = "shizuku_target_path";
     private static final int MAX_FILE_SIZE_BYTES = 1024 * 1024; // 1 MB safety cap
 
     private EditText editor;
     private TextView statusLine;
     private File file;
+    private String shizukuTargetPath;
     private boolean hasUnsavedChanges = false;
 
     @Override
@@ -51,6 +53,7 @@ public class TextEditorActivity extends AppCompatActivity {
         setContentView(R.layout.activity_text_editor);
 
         String filePath = getIntent().getStringExtra(EXTRA_FILE_PATH);
+        shizukuTargetPath = getIntent().getStringExtra(EXTRA_SHIZUKU_TARGET_PATH);
         if (filePath == null) {
             finish();
             return;
@@ -146,6 +149,16 @@ public class TextEditorActivity extends AppCompatActivity {
             } catch (IOException e) {
                 runOnUiThread(() -> Toast.makeText(this, "Failed to save file", Toast.LENGTH_SHORT).show());
                 return;
+            }
+            if (shizukuTargetPath != null && !shizukuTargetPath.isEmpty()) {
+                try {
+                    ShizukuFileHelper.writeLocalToRemote(file, shizukuTargetPath, null);
+                } catch (Exception e) {
+                    runOnUiThread(() -> Toast.makeText(this,
+                            "Saved locally, but failed to write back via Shizuku",
+                            Toast.LENGTH_LONG).show());
+                    return;
+                }
             }
             runOnUiThread(() -> {
                 hasUnsavedChanges = false;

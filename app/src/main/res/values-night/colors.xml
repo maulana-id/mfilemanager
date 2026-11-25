@@ -9,6 +9,7 @@
     <color name="vscode_status_bar">#FF007ACC</color>
     <color name="vscode_selection">#FF094771</color>
     <color name="vscode_selection_check">#FFFFFFFF</color>
+    <color name="vscode_focus_bg">#1F007ACC</color>
     <color name="vscode_list_hover">#FF2A2D2E</color>
     <color name="vscode_icon">#FFCCCCCC</color>
     <color name="vscode_input_bg">#FF3C3C3C</color>
