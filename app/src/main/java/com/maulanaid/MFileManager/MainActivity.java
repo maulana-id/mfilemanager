@@ -40,6 +40,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.provider.Settings;
+import android.provider.DocumentsContract;
 import android.text.Editable;
 import android.text.TextWatcher;
 import android.view.LayoutInflater;
@@ -96,10 +97,14 @@ import java.text.SimpleDateFormat;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import android.webkit.MimeTypeMap;
+import androidx.documentfile.provider.DocumentFile;
+import rikka.shizuku.Shizuku;
 
 public class MainActivity extends AppCompatActivity {
     private static final int PERMISSION_REQUEST_CODE = 100;
     private static final int INSTALL_PERMISSION_REQUEST_CODE = 102;
+    private static final int RESTRICTED_FOLDER_REQUEST_CODE = 103;
+    private static final int SHIZUKU_PERMISSION_REQUEST_CODE = 104;
     private static final String PREFS_NAME = "file_manager_preferences";
     private static final String PREF_USER_AGREEMENT_VERSION = "user_agreement_version";
     private static final int USER_AGREEMENT_VERSION = 1;
@@ -136,6 +141,7 @@ public class MainActivity extends AppCompatActivity {
     private static final String PREF_FTP_ERROR = "ftp_share_error";
     private static final String PREF_HTTP_READONLY = HttpShareService.PREF_HTTP_READONLY;
     private static final String PREF_FTP_READONLY = FtpShareService.PREF_FTP_READONLY;
+    private static final String PREF_RESTRICTED_FOLDER_URI = "restricted_folder_uri";
 
     private RecyclerView fileList;
     private LinearLayoutManager fileLayoutManager;
@@ -177,6 +183,9 @@ public class MainActivity extends AppCompatActivity {
             0);
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private SharedPreferences preferences;
+    private DocumentFile restrictedFolderRoot;
+    private DocumentFile restrictedFolderDirectory;
+    private final List<DocumentFile> restrictedFolderStack = new ArrayList<>();
     private String grouping = GROUP_NONE;
     private String sorting = SORT_NAME;
     private String searchQuery = "";
@@ -194,6 +203,14 @@ public class MainActivity extends AppCompatActivity {
     private int activeOperationPercent = -1;
     private long activeOperationSpeedBytesPerSecond;
     private boolean shareStatusReceiverRegistered;
+    private final Shizuku.OnRequestPermissionResultListener shizukuPermissionListener =
+            (requestCode, grantResult) -> {
+                if (requestCode == SHIZUKU_PERMISSION_REQUEST_CODE) {
+                    toast(grantResult == PackageManager.PERMISSION_GRANTED
+                            ? "Shizuku access granted"
+                            : "Shizuku access was denied");
+                }
+            };
     private final BroadcastReceiver shareStatusReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
@@ -204,6 +221,16 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         preferences = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        Shizuku.addRequestPermissionResultListener(shizukuPermissionListener);
+        String restrictedUri = preferences.getString(PREF_RESTRICTED_FOLDER_URI, null);
+        if (restrictedUri != null) {
+            try {
+                restrictedFolderRoot = DocumentFile.fromTreeUri(this, Uri.parse(restrictedUri));
+                restrictedFolderDirectory = restrictedFolderRoot;
+            } catch (RuntimeException ignored) {
+                restrictedFolderRoot = null;
+            }
+        }
         darkTheme = preferences.getBoolean(PREF_DARK_THEME, false);
         AppCompatDelegate.setDefaultNightMode(darkTheme
                 ? AppCompatDelegate.MODE_NIGHT_YES
@@ -372,6 +399,7 @@ public class MainActivity extends AppCompatActivity {
 
     @Override
     protected void onDestroy() {
+        Shizuku.removeRequestPermissionResultListener(shizukuPermissionListener);
         renderGeneration.incrementAndGet();
         mainHandler.removeCallbacksAndMessages(null);
         clearArchiveClipboard();
@@ -495,6 +523,26 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == RESTRICTED_FOLDER_REQUEST_CODE) {
+            if (resultCode == RESULT_OK && data != null && data.getData() != null) {
+                Uri uri = data.getData();
+                try {
+                    final int takeFlags = data.getFlags()
+                            & (Intent.FLAG_GRANT_READ_URI_PERMISSION
+                            | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                    getContentResolver().takePersistableUriPermission(uri, takeFlags);
+                    preferences.edit().putString(PREF_RESTRICTED_FOLDER_URI, uri.toString()).apply();
+                    restrictedFolderRoot = DocumentFile.fromTreeUri(this, uri);
+                    toast("Restricted folder access granted");
+                    showRestrictedFolderExplorer();
+                } catch (SecurityException exception) {
+                    toast("The selected folder permission could not be persisted");
+                }
+            } else {
+                toast("Restricted folder access was cancelled");
+            }
+            return;
+        }
         if (requestCode == INSTALL_PERMISSION_REQUEST_CODE) {
             File file = pendingInstallFile;
             pendingInstallFile = null;
@@ -614,6 +662,30 @@ public class MainActivity extends AppCompatActivity {
             return true;
         });
 
+        MenuItem restrictedFolderItem = popup.getMenu().add(
+                restrictedFolderRoot == null ? "Grant restricted folder access"
+                        : "Browse restricted folder");
+        restrictedFolderItem.setOnMenuItemClickListener(item -> {
+            if (restrictedFolderRoot == null) {
+                requestRestrictedFolderAccess();
+            } else {
+                showRestrictedFolderExplorer();
+            }
+            return true;
+        });
+
+        MenuItem shizukuItem = popup.getMenu().add("Shizuku restricted access");
+        shizukuItem.setOnMenuItemClickListener(item -> {
+            showShizukuAccessDialog();
+            return true;
+        });
+
+        MenuItem wirelessDebugItem = popup.getMenu().add("Wireless debugging guide");
+        wirelessDebugItem.setOnMenuItemClickListener(item -> {
+            showWirelessDebugGuide();
+            return true;
+        });
+
         MenuItem hiddenFilesItem = popup.getMenu().add("Show hidden files");
         hiddenFilesItem.setCheckable(true).setChecked(showHiddenFiles);
         hiddenFilesItem.setOnMenuItemClickListener(item -> {
@@ -662,6 +734,174 @@ public class MainActivity extends AppCompatActivity {
             return true;
         });
         popup.show();
+    }
+
+    private void requestRestrictedFolderAccess() {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
+                | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+                | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            intent.putExtra(DocumentsContract.EXTRA_INITIAL_URI,
+                    Uri.parse("content://com.android.externalstorage.documents/document/primary:Android"));
+        }
+        startActivityForResult(intent, RESTRICTED_FOLDER_REQUEST_CODE);
+    }
+
+    private void showRestrictedFolderExplorer() {
+        if (restrictedFolderRoot == null) {
+            requestRestrictedFolderAccess();
+            return;
+        }
+        restrictedFolderStack.clear();
+        restrictedFolderDirectory = restrictedFolderRoot;
+        showRestrictedFolderDirectory();
+    }
+
+    private void showRestrictedFolderDirectory() {
+        DocumentFile[] children;
+        try {
+            children = restrictedFolderDirectory.listFiles();
+        } catch (RuntimeException exception) {
+            toast("Restricted folder could not be read");
+            return;
+        }
+        Arrays.sort(children, Comparator.comparing(
+                child -> child.getName() == null ? "" : child.getName(),
+                String.CASE_INSENSITIVE_ORDER));
+
+        List<String> labels = new ArrayList<>();
+        for (DocumentFile child : children) {
+            if (!showHiddenFiles && child.getName() != null && child.getName().startsWith(".")) {
+                continue;
+            }
+            labels.add((child.isDirectory() ? "[Folder] " : "[File] ")
+                    + (child.getName() == null ? "Unnamed" : child.getName()));
+        }
+        if (labels.isEmpty()) {
+            labels.add("(empty folder)");
+        }
+
+        AlertDialog.Builder builder = new AlertDialog.Builder(this)
+                .setTitle(restrictedFolderDirectory.getName() == null
+                        ? "Restricted folder" : restrictedFolderDirectory.getName())
+                .setItems(labels.toArray(new String[0]), (dialog, which) -> {
+                    if (which >= children.length) {
+                        return;
+                    }
+                    DocumentFile selected = null;
+                    int visibleIndex = 0;
+                    for (DocumentFile child : children) {
+                        if (!showHiddenFiles && child.getName() != null
+                                && child.getName().startsWith(".")) {
+                            continue;
+                        }
+                        if (visibleIndex == which) {
+                            selected = child;
+                            break;
+                        }
+                        visibleIndex++;
+                    }
+                    if (selected == null) {
+                        return;
+                    }
+                    if (selected.isDirectory()) {
+                        restrictedFolderStack.add(restrictedFolderDirectory);
+                        restrictedFolderDirectory = selected;
+                        dialog.dismiss();
+                        showRestrictedFolderDirectory();
+                    } else {
+                        openRestrictedDocument(selected);
+                    }
+                })
+                .setNeutralButton("Change folder", (dialog, which) ->
+                        requestRestrictedFolderAccess())
+                .setPositiveButton("Close", null);
+        if (!restrictedFolderStack.isEmpty()) {
+            builder.setNegativeButton("Back", (dialog, which) -> {
+                restrictedFolderDirectory = restrictedFolderStack.remove(
+                        restrictedFolderStack.size() - 1);
+                showRestrictedFolderDirectory();
+            });
+        }
+        builder.show();
+    }
+
+    private void openRestrictedDocument(DocumentFile document) {
+        if (document == null || document.getUri() == null) {
+            toast("Could not open restricted file");
+            return;
+        }
+        String mimeType = document.getType();
+        if (mimeType == null) {
+            mimeType = "*/*";
+        }
+        Intent intent = new Intent(Intent.ACTION_VIEW);
+        intent.setDataAndType(document.getUri(), mimeType);
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        try {
+            startActivity(Intent.createChooser(intent, "Open restricted file"));
+        } catch (ActivityNotFoundException exception) {
+            Intent share = new Intent(Intent.ACTION_SEND);
+            share.setDataAndType(document.getUri(), mimeType);
+            share.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            startActivity(Intent.createChooser(share, "Open or share restricted file"));
+        }
+    }
+
+    private void showShizukuAccessDialog() {
+        boolean binderReady = false;
+        boolean granted = false;
+        try {
+            binderReady = Shizuku.pingBinder();
+            granted = binderReady
+                    && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED;
+        } catch (RuntimeException ignored) {
+        }
+
+        String status = !binderReady
+                ? "Shizuku is not running."
+                : (granted ? "Shizuku permission is granted."
+                        : "Shizuku is running, but permission is not granted.");
+
+        AlertDialog.Builder builder = new AlertDialog.Builder(this)
+                .setTitle("Shizuku restricted access")
+                .setMessage(status + "\n\nShizuku provides elevated shell access for supported "
+                        + "file operations. This app does not connect to Android devices or "
+                        + "bypass Android permissions automatically.")
+                .setNegativeButton("Close", null);
+        if (!binderReady) {
+            builder.setPositiveButton("Open Shizuku", (dialog, which) -> {
+                try {
+                    startActivity(getPackageManager().getLaunchIntentForPackage(
+                            "moe.shizuku.privileged.api"));
+                } catch (RuntimeException exception) {
+                    toast("Install Shizuku first");
+                }
+            });
+        } else if (!granted) {
+            builder.setPositiveButton("Request permission", (dialog, which) ->
+                    Shizuku.requestPermission(SHIZUKU_PERMISSION_REQUEST_CODE));
+        }
+        builder.show();
+    }
+
+    private void showWirelessDebugGuide() {
+        new AlertDialog.Builder(this)
+                .setTitle("Wireless debugging")
+                .setMessage("Wireless debugging is useful for development tools, but an app "
+                        + "cannot safely obtain or reuse your ADB pairing keys without user "
+                        + "action. Do not enter ADB ports or pairing codes into third-party apps.")
+                .setNegativeButton("Close", null)
+                .setPositiveButton("Open developer settings", (dialog, which) -> {
+                    try {
+                        startActivity(new Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS));
+                    } catch (ActivityNotFoundException exception) {
+                        toast("Developer settings are unavailable");
+                    }
+                })
+                .show();
     }
 
     private void addSettingChoice(SubMenu menu, String title, String value,

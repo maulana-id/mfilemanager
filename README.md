@@ -22,6 +22,8 @@ A simple Android file manager for browsing shared storage and performing basic f
 - Confirm before recursively deleting selected files or folders.
 - Switch between VS Code-inspired light and dark color themes.
 - Request storage access according to the Android version.
+- Browse user-granted restricted folders through Android's Storage Access Framework.
+- Detect Shizuku availability and permission, and provide a wireless-debugging settings guide.
 
 ## First-Run Acknowledgement
 
@@ -211,6 +213,14 @@ The app has a minimum SDK of 24 and targets SDK 34, configured in `app/build.gra
 - On Android 10 and older, it requests the applicable external storage runtime permissions.
 
 The app's storage permission is sensitive. Google Play distribution may require the permission to meet the Play policy for broad file access; review current Play policy before publishing.
+
+### Restricted folders
+
+Use **Settings → Grant restricted folder access** to select `Android/data`, `Android/obb`, or another folder with Android's document picker. The persisted grant is exposed through **Settings → Browse restricted folder**. Folder navigation and file-opening actions use Storage Access Framework; copy, rename, and delete operations inside the existing main file list are not added to SAF-only grants.
+
+**Settings → Shizuku restricted access** reports whether the Shizuku binder is running and whether the app has permission. It does not start Shizuku or grant elevated shell access automatically.
+
+Wireless debugging is available as a developer-settings guide only. MFIle Manager does not connect to localhost ADB ports or reuse pairing credentials, since pairing and ADB authorization must remain under the user's control.
 
 ## Project Layout
 
